@@ -19,6 +19,10 @@ import threading
 import time
 import zipfile
 import gzip
+try:
+    import tkinterdnd2 as dnd
+except ImportError:  # drag-and-drop support is optional at runtime
+    dnd = None
 import os
 from copy import copy
 from pathlib import Path
@@ -750,6 +754,7 @@ class App:
         from tkinter import ttk
         self.tk = tk
         self.ttk = ttk
+        self.dnd = dnd
         self.root = root
         root.title("usbi.sh 解压并生成 Excel 清单")
         root.geometry("900x650")
@@ -778,19 +783,31 @@ class App:
         main.columnconfigure(3, weight=1)
 
         ttk.Label(main, text="基线版本 usbi.sh（可选）：").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.baseline_source).grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
+        baseline_entry = ttk.Entry(main, textvariable=self.baseline_source)
+        baseline_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
+        baseline_entry.drop_target_register(self.dnd.DND_FILES)
+        baseline_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.baseline_source))
         ttk.Button(main, text="选择文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(main, text="对比版本 usbi.sh（必选）：").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.compare_source).grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        compare_entry = ttk.Entry(main, textvariable=self.compare_source)
+        compare_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        compare_entry.drop_target_register(self.dnd.DND_FILES)
+        compare_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.compare_source))
         ttk.Button(main, text="选择文件", command=self.pick_compare).grid(row=1, column=3, padx=(8, 0))
 
         ttk.Label(main, text="输出目录：").grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.output_dir).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
+        output_entry = ttk.Entry(main, textvariable=self.output_dir)
+        output_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
+        output_entry.drop_target_register(self.dnd.DND_FILES)
+        output_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.output_dir))
         ttk.Button(main, text="选择目录", command=self.pick_output).grid(row=2, column=3, padx=(8, 0))
 
         ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.template).grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        template_entry = ttk.Entry(main, textvariable=self.template)
+        template_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        template_entry.drop_target_register(self.dnd.DND_FILES)
+        template_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.template))
         ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=3, column=3, padx=(8, 0))
 
         ttk.Label(main, text="基线版本号（可选）：").grid(row=4, column=0, sticky="w", pady=6)
@@ -822,9 +839,16 @@ class App:
         main.rowconfigure(10, weight=1)
         ttk.Label(
             main,
-            text="对比版本必填；只填写对比版本时生成单版本清单，填写基线版本后生成三个工作表对比结果。临时解压目录默认自动删除。",
+            text="使用说明：支持直接拖拽：基线/对比 .sh 文件、输出目录、Excel 模板.xlsx。对比版本必填；只填写对比版本时生成单版本清单。",
             foreground="#555555",
         ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+    def _handle_drop(self, event, variable):
+        paths = self.root.tk.splitlist(event.data)
+        if not paths:
+            return
+        path = Path(paths[0]).expanduser()
+        variable.set(str(path.resolve() if path.exists() else path))
 
     def _log(self, message):
         self.events.put(("log", message))
@@ -1053,7 +1077,7 @@ def main():
         return
     try:
         import tkinter as tk
-        root = tk.Tk()
+        root = dnd.TkinterDnD.Tk() if dnd else tk.Tk()
     except Exception as exc:
         raise SystemExit(f"无法启动图形界面：{exc}") from exc
     App(root)
