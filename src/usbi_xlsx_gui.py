@@ -877,7 +877,7 @@ class App:
         self.ttk = ttk
         self.dnd = dnd
         self.root = root
-        root.title("点检表对照程序")
+        root.title("点检表对比软件")
         root.geometry("900x650")
         root.minsize(820, 580)
         self.baseline_source = tk.StringVar()
@@ -890,7 +890,7 @@ class App:
         # Temporary extraction data is an implementation detail; clean it up
         # by default and allow users to opt in to retaining it for inspection.
         self.keep = tk.BooleanVar(value=False)
-        self.include_metadata = tk.BooleanVar(value=True)
+        self.exclude_metadata = tk.BooleanVar(value=False)
         self.events = queue.Queue()
         self.busy = False
         self.last_output: Path | None = None
@@ -952,7 +952,7 @@ class App:
         ttk.Checkbutton(main, text="保留临时解压目录（默认自动删除）", variable=self.keep).grid(
             row=7, column=1, columnspan=3, sticky="w", pady=3
         )
-        ttk.Checkbutton(main, text="排除 checksums.txt 和 .gitkeep", variable=self.include_metadata).grid(
+        ttk.Checkbutton(main, text="排除 checksums.txt 和 .gitkeep", variable=self.exclude_metadata).grid(
             row=8, column=1, columnspan=3, sticky="w", pady=3
         )
 
@@ -967,10 +967,10 @@ class App:
         scroll = ttk.Scrollbar(main, orient="vertical", command=self.log_box.yview)
         scroll.grid(row=11, column=4, sticky="ns", pady=(5, 0))
         self.log_box.configure(yscrollcommand=scroll.set)
-        main.rowconfigure(10, weight=1)
+        main.rowconfigure(11, weight=1)
         ttk.Label(
             main,
-            text="使用说明：选择点检表 Excel 工作簿后，软件会自动读取工作表供选择；再选择待安装包 usbi.sh。对比结果按文件路径、文件名和 MD5 进行判断。",
+            text="使用说明：（文件支持拖拽）选择点检表 Excel 工作簿后，软件会自动读取工作表供选择；再选择待安装包 usbi.sh。对比结果按文件路径、文件名和 MD5 进行判断。",
             foreground="#555555",
         ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
     def _handle_drop(self, event, variable):
@@ -1153,7 +1153,7 @@ class App:
             self.baseline_version.get(),
             self.compare_version.get(),
             self.keep.get(),
-            self.include_metadata.get(),
+            not self.exclude_metadata.get(),
             self.baseline_sheet.get().strip(),
         )
         threading.Thread(target=self._worker, args=args, daemon=True).start()
