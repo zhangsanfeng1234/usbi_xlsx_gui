@@ -26,7 +26,7 @@ except ImportError:  # drag-and-drop support is optional at runtime
 import os
 from copy import copy
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NamedTuple
 
 try:
     import openpyxl
@@ -43,12 +43,64 @@ PROJECT_ROOT = ROOT.parent
 FROZEN_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 DEFAULT_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "备注"]
+CHECKLIST_HEADERS = ["文件类型", "文件名称", "版本号", "路径", "MD5值", "crc", "备注"]
 INSTALL_PACKAGE_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "git仓库地址", "备注"]
+DEFAULT_ROLE_ORDER = ("name", "version", "path", "md5", "note")
+CHECKLIST_ROLE_ORDER = ("file_type", "name", "version", "path", "md5", "crc", "note")
+INSTALL_PACKAGE_ROLE_ORDER = ("name", "version", "path", "md5", "git_repo", "note")
+HEADER_BY_ROLE = {
+    "file_type": "文件类型",
+    "name": "文件名称",
+    "version": "版本号",
+    "path": "路径",
+    "md5": "MD5值",
+    "crc": "crc",
+    "note": "备注",
+    "git_repo": "git仓库地址",
+}
 MANIFEST_COLUMN_COUNT = len(DEFAULT_HEADERS)
+CHECKLIST_COLUMN_COUNT = len(CHECKLIST_HEADERS)
 INSTALL_PACKAGE_COLUMN_COUNT = len(INSTALL_PACKAGE_HEADERS)
 METADATA_FILE_NAMES = frozenset({"checksums.txt", ".gitkeep"})
 GREEN_FILL = "FF92D050"
 YELLOW_FILL = "FFFFFF00"
+
+
+class ManifestRecord(NamedTuple):
+    """A file manifest row.
+
+    The first five fields keep the historical tuple order used by the
+    comparison logic: 文件名称、版本号、路径、MD5值、备注. 文件类型 and crc are appended
+    for point-check sheets that use the 7-column checklist format.
+    """
+
+    name: str
+    version: str
+    path: str
+    md5: str
+    note: str = ""
+    file_type: str = ""
+    crc: str = ""
+
+
+class ManifestLayout(NamedTuple):
+    columns: dict[str, int]
+    headers: dict[int, str]
+    column_count: int
+
+
+def _layout_from_role_order(roles: tuple[str, ...]) -> ManifestLayout:
+    columns = {role: index for index, role in enumerate(roles, start=1)}
+    headers = {index: HEADER_BY_ROLE[role] for index, role in enumerate(roles, start=1)}
+    return ManifestLayout(columns, headers, len(roles))
+
+
+def _default_manifest_layout() -> ManifestLayout:
+    return _layout_from_role_order(DEFAULT_ROLE_ORDER)
+
+
+def _install_package_layout() -> ManifestLayout:
+    return _layout_from_role_order(INSTALL_PACKAGE_ROLE_ORDER)
 
 
 def md5_file(path: Path) -> str:
@@ -196,7 +248,7 @@ def iter_regular_files(root: Path) -> Iterable[Path]:
 
 
 def collect_records(extracted_root: Path, version: str, include_metadata: bool = True,
-                    log: Callable[[str], None] | None = None) -> list[tuple[str, str, str, str, str]]:
+                    log: Callable[[str], None] | None = None) -> list[ManifestRecord]:
     records = []
     for path in sorted(iter_regular_files(extracted_root), key=lambda p: p.relative_to(extracted_root).as_posix().lower()):
         relative = path.relative_to(extracted_root)
@@ -210,7 +262,7 @@ def collect_records(extracted_root: Path, version: str, include_metadata: bool =
         parent = relative.parent.as_posix()
         excel_path = "update" if parent == "." else "update\\" + parent.replace("/", "\\")
         digest = md5_file(path)
-        records.append((relative.name, version, excel_path, digest, ""))
+        records.append(ManifestRecord(relative.name, version, excel_path, digest, ""))
         if log:
             log(f"MD5 {digest}  {relative.as_posix()}")
     return records
@@ -292,6 +344,9 @@ def _manifest_header_role(value: object | None) -> str | None:
     if not text:
         return None
     return {
+        "文件类型": "file_type",
+        "类型": "file_type",
+        "filetype": "file_type",
         "文件名称": "name",
         "文件名": "name",
         "名称": "name",
@@ -305,6 +360,10 @@ def _manifest_header_role(value: object | None) -> str | None:
         "path": "path",
         "md5值": "md5",
         "md5": "md5",
+        "crc值": "crc",
+        "crc": "crc",
+        "crc校验": "crc",
+        "校验码": "crc",
         "备注": "note",
         "说明": "note",
         "note": "note",
@@ -312,26 +371,68 @@ def _manifest_header_role(value: object | None) -> str | None:
     }.get(text)
 
 
+def _manifest_layout_from_columns(columns: dict[str, int], header_values: dict[int, str]) -> ManifestLayout:
+    column_count = max(columns.values(), default=MANIFEST_COLUMN_COUNT)
+    headers: dict[int, str] = {}
+    for col in range(1, column_count + 1):
+        header = header_values.get(col, "")
+        if not header:
+            role = next((role for role, role_col in columns.items() if role_col == col), None)
+            header = HEADER_BY_ROLE.get(role, "") if role else ""
+        headers[col] = header
+    return ManifestLayout(dict(columns), headers, column_count)
+
+
+def _detect_manifest_header(ws, max_rows: int = 80, max_cols: int = 40):
+    """Return ``(header_row, layout)`` for a worksheet manifest table, if any."""
+    scan_cols = min(max(ws.max_column or 0, CHECKLIST_COLUMN_COUNT), max_cols)
+    for row_idx in range(1, min(ws.max_row or 0, max_rows) + 1):
+        found: dict[str, int] = {}
+        header_values: dict[int, str] = {}
+        for col_idx in range(1, scan_cols + 1):
+            header_text = _cell_text(ws.cell(row_idx, col_idx).value)
+            if header_text:
+                header_values[col_idx] = header_text
+            role = _manifest_header_role(header_text)
+            if role and role not in found:
+                found[role] = col_idx
+
+        if {"name", "path", "md5"}.issubset(found):
+            return row_idx, _manifest_layout_from_columns(found, header_values)
+
+    return None
+
+
+def _record_value(record, role: str | None) -> str:
+    if role is None or role == "git_repo":
+        return ""
+    if hasattr(record, role):
+        return _cell_text(getattr(record, role))
+    legacy_index = {"name": 0, "version": 1, "path": 2, "md5": 3, "note": 4}.get(role)
+    if legacy_index is not None and len(record) > legacy_index:
+        return _cell_text(record[legacy_index])
+    return ""
+
+
 def _find_manifest_sheet(workbook):
     """Return the first worksheet that looks like a manifest table."""
     for ws in workbook.worksheets:
-        max_col = max(5, min(ws.max_column or 0, 30))
-        for row_idx in range(1, min(ws.max_row or 0, 25) + 1):
-            columns: dict[str, int] = {}
-            for col_idx in range(1, max_col + 1):
-                role = _manifest_header_role(ws.cell(row_idx, col_idx).value)
-                if role and role not in columns:
-                    columns[role] = col_idx
-            if {"name", "path", "md5"}.issubset(columns):
-                return ws, row_idx, columns
+        detected = _detect_manifest_header(ws, max_rows=25, max_cols=30)
+        if detected:
+            row_idx, layout = detected
+            return ws, row_idx, layout.columns
     raise ValueError("无法在 Excel 工作簿中找到可识别的清单工作表。")
 
 
 def list_workbook_sheets(source: Path) -> list[str]:
-    """读取用户选择的点检表 Excel 中的全部工作表名称。"""
+    """读取用户选择的点检表 Excel 中可识别的文件清单工作表名称。"""
     workbook = load_workbook(source.expanduser().resolve(), read_only=True, data_only=True)
     try:
-        return list(workbook.sheetnames)
+        manifest_sheets = [
+            ws.title for ws in workbook.worksheets
+            if _detect_manifest_header(ws) is not None
+        ]
+        return manifest_sheets or list(workbook.sheetnames)
     finally:
         workbook.close()
 
@@ -342,7 +443,7 @@ def load_manifest_records_from_workbook(
     include_metadata: bool = True,
     log: Callable[[str], None] | None = None,
     sheet_name: str | None = None,
-) -> tuple[list[tuple[str, str, str, str, str]], str]:
+) -> tuple[list[ManifestRecord], str]:
     """从用户指定的 Excel 工作表读取点检表文件清单。"""
     workbook = load_workbook(source.expanduser().resolve(), data_only=True)
 
@@ -357,30 +458,22 @@ def load_manifest_records_from_workbook(
             )
 
         sheet = workbook[sheet_name]
-        header_row = None
-        columns: dict[str, int] = {}
-
-        # 只在用户选择的工作表中寻找表头。
-        for row_idx in range(1, min(sheet.max_row or 0, 80) + 1):
-            found: dict[str, int] = {}
-            for col_idx in range(1, min(sheet.max_column or 0, 40) + 1):
-                role = _manifest_header_role(sheet.cell(row_idx, col_idx).value)
-                if role and role not in found:
-                    found[role] = col_idx
-
-            if {"name", "path", "md5"}.issubset(found):
-                header_row = row_idx
-                columns = found
-                break
-
-        if header_row is None:
+        detected = _detect_manifest_header(sheet)
+        if detected is None:
             raise ValueError(
                 f"工作表“{sheet_name}”中未找到可识别的文件清单表头。"
                 "至少需要：文件名称、路径、MD5值。"
             )
 
-        records: list[tuple[str, str, str, str, str]] = []
+        header_row, layout = detected
+        columns = layout.columns
+
+        records: list[ManifestRecord] = []
         for row_idx in range(header_row + 1, sheet.max_row + 1):
+            file_type = (
+                _cell_text(sheet.cell(row_idx, columns["file_type"]).value)
+                if "file_type" in columns else ""
+            )
             name = _cell_text(sheet.cell(row_idx, columns["name"]).value)
             version = (
                 _cell_text(sheet.cell(row_idx, columns["version"]).value)
@@ -388,12 +481,16 @@ def load_manifest_records_from_workbook(
             )
             path_value = _cell_text(sheet.cell(row_idx, columns["path"]).value)
             md5 = _cell_text(sheet.cell(row_idx, columns["md5"]).value)
+            crc = (
+                _cell_text(sheet.cell(row_idx, columns["crc"]).value)
+                if "crc" in columns else ""
+            )
             note = (
                 _cell_text(sheet.cell(row_idx, columns["note"]).value)
                 if "note" in columns else ""
             )
 
-            if not any((name, version, path_value, md5, note)):
+            if not any((file_type, name, version, path_value, md5, crc, note)):
                 continue
             if not name or not path_value or not md5:
                 continue
@@ -406,7 +503,7 @@ def load_manifest_records_from_workbook(
                     log(f"跳过元数据文件：{path_value}/{name}")
                 continue
 
-            records.append((name, version, path_value, md5, note))
+            records.append(ManifestRecord(name, version, path_value, md5, note, file_type, crc))
 
             if log:
                 log(f"点检表 MD5 {md5}  {path_value}/{name}")
@@ -436,16 +533,26 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
             ws = wb[sheet_name]
         else:
             ws = wb.active
+
+        detected = _detect_manifest_header(ws)
+        if detected:
+            header_row, layout = detected
+        else:
+            # Custom templates without a recognizable header keep the original
+            # 5-column fallback layout.
+            header_row, layout = 1, _default_manifest_layout()
+
         style_by_path: dict[str, tuple] = {}
         style_by_kind: dict[str, tuple] = {}
         style_by_fill: dict[str, tuple] = {}
         fill_by_kind: dict[str, tuple] = {}
 
-        for row in range(2, ws.max_row + 1):
-            path_value = ws.cell(row, 3).value
+        path_col = layout.columns.get("path", 3)
+        for row in range(header_row + 1, ws.max_row + 1):
+            path_value = ws.cell(row, path_col).value
             if not isinstance(path_value, str) or not path_value.strip():
                 continue
-            styles = tuple(copy(ws.cell(row, col)._style) for col in range(1, MANIFEST_COLUMN_COUNT + 1))
+            styles = tuple(copy(ws.cell(row, col)._style) for col in range(1, layout.column_count + 1))
             normalized_path = _normalise_manifest_path(path_value)
             style_by_path.setdefault(normalized_path, styles)
             style_by_kind.setdefault(_style_for_path(path_value), styles)
@@ -454,24 +561,27 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
                 style_by_fill.setdefault(fill_kind, styles)
                 fill_by_kind.setdefault(
                     fill_kind,
-                    tuple(copy(ws.cell(row, col).fill) for col in range(1, MANIFEST_COLUMN_COUNT + 1)),
+                    tuple(copy(ws.cell(row, col).fill) for col in range(1, layout.column_count + 1)),
                 )
 
+        if header_row > 1:
+            ws.delete_rows(1, header_row - 1)
         if clear_data_rows and ws.max_row > 1:
             ws.delete_rows(2, ws.max_row - 1)
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = "Sheet1"
-        for col, value in enumerate(DEFAULT_HEADERS, 1):
-            cell = ws.cell(1, col, value)
+        layout = _default_manifest_layout()
+        for col in range(1, layout.column_count + 1):
+            cell = ws.cell(1, col, layout.headers.get(col, ""))
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill("solid", fgColor="4472C4")
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = Border(bottom=Side(style="thin", color="808080"))
         ws.row_dimensions[1].height = 21
-        for col, width in {"A": 34, "B": 14, "C": 62, "D": 36, "E": 24}.items():
-            ws.column_dimensions[col].width = width
+        for col, width in {1: 34, 2: 14, 3: 62, 4: 36, 5: 24}.items():
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
         # Build two generic row styles only for the fallback case where the
         # default template is unavailable.
@@ -482,12 +592,13 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
         for fill_kind, color in (("green", GREEN_FILL), ("yellow", YELLOW_FILL)):
             sample_styles = []
             sample_fills = []
-            for col in range(1, MANIFEST_COLUMN_COUNT + 1):
+            for col in range(1, layout.column_count + 1):
+                role = next((role for role, role_col in layout.columns.items() if role_col == col), None)
                 cell = ws.cell(2, col)
-                cell.font = Font(name="Consolas" if col == 1 or col == 4 else "Arial", size=10)
-                cell.fill = PatternFill("solid", fgColor=color) if col < 5 else PatternFill()
+                cell.font = Font(name="Consolas" if role in {"name", "md5"} else "Arial", size=10)
+                cell.fill = PatternFill("solid", fgColor=color) if role != "note" else PatternFill()
                 cell.alignment = Alignment(
-                    horizontal="center" if col == 2 else "left",
+                    horizontal="center" if role == "version" else "left",
                     vertical="center",
                 )
                 cell.border = Border(
@@ -503,73 +614,78 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
             fill_by_kind[fill_kind] = tuple(sample_fills)
         ws.delete_rows(2, 1)
 
-    return wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind
-def _copy_manifest_layout(source_ws, target_ws) -> None:
+    return wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind, layout
+
+
+def _copy_manifest_layout(source_ws, target_ws, layout: ManifestLayout) -> None:
     """Copy the visible manifest header and column layout to another sheet."""
-    for col in range(1, MANIFEST_COLUMN_COUNT + 1):
+    for col in range(1, layout.column_count + 1):
         letter = openpyxl.utils.get_column_letter(col)
         target_ws.column_dimensions[letter].width = source_ws.column_dimensions[letter].width
         src = source_ws.cell(1, col)
-        dst = target_ws.cell(1, col, src.value if src.value is not None else DEFAULT_HEADERS[col - 1])
+        dst = target_ws.cell(1, col, src.value if src.value is not None else layout.headers.get(col, ""))
         if src.has_style:
             dst._style = copy(src._style)
         dst.alignment = copy(src.alignment)
     target_ws.row_dimensions[1].height = source_ws.row_dimensions[1].height
 
 
-def _copy_install_package_layout(source_ws, target_ws) -> None:
-    """Copy the manifest layout and add git仓库地址 only for the 安装包文件信息 sheet."""
-    # Copy 文件名称/版本号/路径/MD5值 as-is.
-    for col in range(1, MANIFEST_COLUMN_COUNT):
-        letter = openpyxl.utils.get_column_letter(col)
-        target_ws.column_dimensions[letter].width = source_ws.column_dimensions[letter].width
-        src = source_ws.cell(1, col)
-        dst = target_ws.cell(1, col, src.value if src.value is not None else DEFAULT_HEADERS[col - 1])
+def _copy_install_package_layout(source_ws, target_ws, source_layout: ManifestLayout) -> ManifestLayout:
+    """Copy a suitable layout for the 安装包文件信息 sheet."""
+    if "file_type" in source_layout.columns or "crc" in source_layout.columns:
+        target_layout = ManifestLayout(
+            dict(source_layout.columns),
+            dict(source_layout.headers),
+            source_layout.column_count,
+        )
+        _copy_manifest_layout(source_ws, target_ws, target_layout)
+        return target_layout
+
+    # Historical 5-column manifests keep the extra blank git仓库地址 column on
+    # 安装包文件信息.  Seven-column checklist sheets are copied as-is above.
+    target_layout = _install_package_layout()
+    for role in INSTALL_PACKAGE_ROLE_ORDER:
+        target_col = target_layout.columns[role]
+        if role == "git_repo":
+            source_col = source_layout.columns.get("note", source_layout.column_count)
+        else:
+            source_col = source_layout.columns.get(role, min(target_col, source_layout.column_count))
+
+        target_letter = openpyxl.utils.get_column_letter(target_col)
+        source_letter = openpyxl.utils.get_column_letter(source_col)
+        target_ws.column_dimensions[target_letter].width = (
+            36 if role == "git_repo" else source_ws.column_dimensions[source_letter].width
+        )
+        src = source_ws.cell(1, source_col)
+        dst = target_ws.cell(1, target_col, target_layout.headers.get(target_col, ""))
         if src.has_style:
             dst._style = copy(src._style)
         dst.alignment = copy(src.alignment)
 
-    # Insert git仓库地址 before 备注, only on 安装包文件信息.
-    source_note_col = MANIFEST_COLUMN_COUNT
-    note_src = source_ws.cell(1, source_note_col)
-
-    git_col = 5
-    git_letter = openpyxl.utils.get_column_letter(git_col)
-    target_ws.column_dimensions[git_letter].width = 36
-    git_cell = target_ws.cell(1, git_col, INSTALL_PACKAGE_HEADERS[git_col - 1])
-    if note_src.has_style:
-        git_cell._style = copy(note_src._style)
-    git_cell.alignment = copy(note_src.alignment)
-
-    note_col = 6
-    note_letter = openpyxl.utils.get_column_letter(note_col)
-    target_ws.column_dimensions[note_letter].width = source_ws.column_dimensions[
-        openpyxl.utils.get_column_letter(source_note_col)
-    ].width
-    note_cell = target_ws.cell(1, note_col, INSTALL_PACKAGE_HEADERS[note_col - 1])
-    if note_src.has_style:
-        note_cell._style = copy(note_src._style)
-    note_cell.alignment = copy(note_src.alignment)
-
     target_ws.row_dimensions[1].height = source_ws.row_dimensions[1].height
+    return target_layout
 
 
-def _write_manifest_sheet(ws, records: list[tuple[str, str, str, str, str]],
-                          style_by_path: dict[str, tuple], style_by_kind: dict[str, tuple],
-                          style_by_fill: dict[str, tuple], fill_by_kind: dict[str, tuple]) -> None:
+def _copy_tuple_item(items: tuple, col: int):
+    return copy(items[min(col, len(items)) - 1])
+
+
+def _write_records_sheet(ws, records, style_by_path: dict[str, tuple],
+                         style_by_kind: dict[str, tuple], style_by_fill: dict[str, tuple],
+                         fill_by_kind: dict[str, tuple], layout: ManifestLayout) -> None:
     """Write one file manifest sheet; background switches whenever path changes."""
     if ws.max_row > 1:
         ws.delete_rows(2, ws.max_row - 1)
 
-    # Ensure headers exist even if a custom template has a blank header cell.
-    for col, value in enumerate(DEFAULT_HEADERS, 1):
+    role_by_col = {col: role for role, col in layout.columns.items()}
+    for col in range(1, layout.column_count + 1):
         if ws.cell(1, col).value is None:
-            ws.cell(1, col, value)
+            ws.cell(1, col, layout.headers.get(col, ""))
 
     last_path_key: str | None = None
     current_fill_kind = "yellow"
     for row_num, record in enumerate(records, start=2):
-        path_value = record[2]
+        path_value = _record_value(record, "path")
         path_key = _normalise_manifest_path(path_value)
         if path_key != last_path_key:
             # Toggle fill when the file path changes. Files under the same path
@@ -584,89 +700,65 @@ def _write_manifest_sheet(ws, records: list[tuple[str, str, str, str, str]],
             or style_by_fill.get(fill_kind)
         )
         fills = fill_by_kind.get(fill_kind)
-        for col, value in enumerate(record, start=1):
+        for col in range(1, layout.column_count + 1):
+            role = role_by_col.get(col)
+            value = _record_value(record, role)
             cell = ws.cell(row_num, col, value=value if value != "" else None)
             if styles:
-                cell._style = copy(styles[col - 1])
+                cell._style = _copy_tuple_item(styles, col)
             if fills:
-                cell.fill = copy(fills[col - 1])
+                cell.fill = _copy_tuple_item(fills, col)
             alignment = copy(cell.alignment)
             alignment.vertical = "center"
             alignment.wrap_text = False
             cell.alignment = alignment
 
     end_row = len(records) + 1
-    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(MANIFEST_COLUMN_COUNT)}{end_row}"
-    ws.freeze_panes = "A2"
-    ws.print_area = f"A1:{openpyxl.utils.get_column_letter(MANIFEST_COLUMN_COUNT)}{end_row}"
-
-
-def _write_install_package_sheet(ws, records: list[tuple[str, str, str, str, str]],
-                                 style_by_path: dict[str, tuple], style_by_kind: dict[str, tuple],
-                                 style_by_fill: dict[str, tuple], fill_by_kind: dict[str, tuple]) -> None:
-    """Write the 安装包文件信息 sheet with an extra blank git仓库地址 column."""
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row - 1)
-
-    for col, value in enumerate(INSTALL_PACKAGE_HEADERS, 1):
-        if ws.cell(1, col).value is None:
-            ws.cell(1, col, value)
-
-    last_path_key: str | None = None
-    current_fill_kind = "yellow"
-    for row_num, record in enumerate(records, start=2):
-        path_value = record[2]
-        path_key = _normalise_manifest_path(path_value)
-        if path_key != last_path_key:
-            current_fill_kind = "green" if current_fill_kind == "yellow" else "yellow"
-            last_path_key = path_key
-        style_kind = _style_for_path(path_value)
-        fill_kind = current_fill_kind
-        styles = (
-            style_by_path.get(path_key)
-            or style_by_kind.get(style_kind)
-            or style_by_fill.get(fill_kind)
-        )
-        fills = fill_by_kind.get(fill_kind)
-        values = (record[0], record[1], record[2], record[3], "", record[4])
-        for col, value in enumerate(values, start=1):
-            cell = ws.cell(row_num, col, value=value if value != "" else None)
-            source_col_index = col if col <= MANIFEST_COLUMN_COUNT else MANIFEST_COLUMN_COUNT
-            if styles:
-                cell._style = copy(styles[source_col_index - 1])
-            if fills:
-                cell.fill = copy(fills[source_col_index - 1])
-            alignment = copy(cell.alignment)
-            alignment.vertical = "center"
-            alignment.wrap_text = False
-            cell.alignment = alignment
-
-    end_row = len(records) + 1
-    last_col = openpyxl.utils.get_column_letter(INSTALL_PACKAGE_COLUMN_COUNT)
+    last_col = openpyxl.utils.get_column_letter(layout.column_count)
     ws.auto_filter.ref = f"A1:{last_col}{end_row}"
     ws.freeze_panes = "A2"
     ws.print_area = f"A1:{last_col}{end_row}"
 
-def make_workbook(records: list[tuple[str, str, str, str, str]], output: Path,
+
+def _write_manifest_sheet(ws, records: list[ManifestRecord],
+                          style_by_path: dict[str, tuple], style_by_kind: dict[str, tuple],
+                          style_by_fill: dict[str, tuple], fill_by_kind: dict[str, tuple],
+                          layout: ManifestLayout | None = None) -> None:
+    _write_records_sheet(
+        ws, records, style_by_path, style_by_kind, style_by_fill, fill_by_kind,
+        layout or _default_manifest_layout(),
+    )
+
+
+def _write_install_package_sheet(ws, records: list[ManifestRecord],
+                                 style_by_path: dict[str, tuple], style_by_kind: dict[str, tuple],
+                                 style_by_fill: dict[str, tuple], fill_by_kind: dict[str, tuple],
+                                 layout: ManifestLayout | None = None) -> None:
+    _write_records_sheet(
+        ws, records, style_by_path, style_by_kind, style_by_fill, fill_by_kind,
+        layout or _install_package_layout(),
+    )
+
+def make_workbook(records: list[ManifestRecord], output: Path,
                   template: Path | None = None) -> None:
     """Write a single-version manifest workbook."""
-    wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind = _manifest_workbook_from_template(template)
-    _write_manifest_sheet(ws, records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
+    wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind, layout = _manifest_workbook_from_template(template)
+    _write_manifest_sheet(ws, records, style_by_path, style_by_kind, style_by_fill, fill_by_kind, layout)
     output.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
 
 
-def _record_key(record: tuple[str, str, str, str, str]) -> str:
+def _record_key(record: ManifestRecord) -> str:
     """Compare records by file path + file name."""
     return f"{_normalise_manifest_path(record[2])}\\{str(record[0]).casefold()}"
 
 
-def _record_sort_key(record: tuple[str, str, str, str, str]) -> tuple[str, str]:
+def _record_sort_key(record: ManifestRecord) -> tuple[str, str]:
     return (_normalise_manifest_path(record[2]), str(record[0]).casefold())
 
 
-def compare_record_sets(baseline_records: list[tuple[str, str, str, str, str]],
-                        compare_records: list[tuple[str, str, str, str, str]]):
+def compare_record_sets(baseline_records: list[ManifestRecord],
+                        compare_records: list[ManifestRecord]):
     """Return added, missing and changed files from compare_records against baseline_records."""
     baseline_by_key = {_record_key(record): record for record in baseline_records}
     compare_by_key = {_record_key(record): record for record in compare_records}
@@ -718,12 +810,12 @@ def _write_compare_section(ws, start_row: int, title: str, fill_color: str,
     return header_row + len(rows) + 2
 
 
-def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, str]],
-                             compare_records: list[tuple[str, str, str, str, str]],
+def make_comparison_workbook(baseline_records: list[ManifestRecord],
+                             compare_records: list[ManifestRecord],
                              output: Path, template: Path | None = None,
                              template_sheet: str | None = None) -> tuple[int, int, int]:
     """Write a three-sheet workbook: baseline, compared version, and comparison result."""
-    wb, base_ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind = _manifest_workbook_from_template(
+    wb, base_ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind, base_layout = _manifest_workbook_from_template(
         template, template_sheet
     )
     for sheet in list(wb.worksheets):
@@ -731,11 +823,11 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
             wb.remove(sheet)
 
     base_ws.title = "原始点检表"
-    _write_manifest_sheet(base_ws, baseline_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
+    _write_manifest_sheet(base_ws, baseline_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind, base_layout)
 
     compare_ws = wb.create_sheet("安装包文件信息")
-    _copy_install_package_layout(base_ws, compare_ws)
-    _write_install_package_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
+    compare_layout = _copy_install_package_layout(base_ws, compare_ws, base_layout)
+    _write_install_package_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind, compare_layout)
 
     added, missing, changed = compare_record_sets(baseline_records, compare_records)
     result_ws = wb.create_sheet("对比结果")
