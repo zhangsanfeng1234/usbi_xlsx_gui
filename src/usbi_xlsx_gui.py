@@ -304,12 +304,162 @@ def _fill_kind_for_path(path_value: str) -> str:
     } else "green"
 
 
-def _manifest_workbook_from_template(template: Path | None):
+def _cell_text(value: object | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _manifest_header_role(value: object | None) -> str | None:
+    text = re.sub(r"\s+", "", _cell_text(value)).casefold()
+    if not text:
+        return None
+    return {
+        "文件名称": "name",
+        "文件名": "name",
+        "名称": "name",
+        "filename": "name",
+        "file": "name",
+        "版本号": "version",
+        "版本": "version",
+        "version": "version",
+        "路径": "path",
+        "文件路径": "path",
+        "path": "path",
+        "md5值": "md5",
+        "md5": "md5",
+        "备注": "note",
+        "说明": "note",
+        "note": "note",
+    }.get(text)
+
+
+def _find_manifest_sheet(workbook):
+    """Return the first worksheet that looks like a manifest table."""
+    for ws in workbook.worksheets:
+        max_col = max(5, min(ws.max_column or 0, 30))
+        for row_idx in range(1, min(ws.max_row or 0, 25) + 1):
+            columns: dict[str, int] = {}
+            for col_idx in range(1, max_col + 1):
+                role = _manifest_header_role(ws.cell(row_idx, col_idx).value)
+                if role and role not in columns:
+                    columns[role] = col_idx
+            if {"name", "path", "md5"}.issubset(columns):
+                return ws, row_idx, columns
+    raise ValueError("无法在 Excel 工作簿中找到可识别的清单工作表。")
+
+
+def list_workbook_sheets(source: Path) -> list[str]:
+    """读取用户选择的基线 Excel 中的全部工作表名称。"""
+    workbook = load_workbook(source.expanduser().resolve(), read_only=True, data_only=True)
+    try:
+        return list(workbook.sheetnames)
+    finally:
+        workbook.close()
+
+
+def load_manifest_records_from_workbook(
+    source: Path,
+    default_version: str = "",
+    include_metadata: bool = True,
+    log: Callable[[str], None] | None = None,
+    sheet_name: str | None = None,
+) -> tuple[list[tuple[str, str, str, str, str]], str]:
+    """从用户指定的 Excel 工作表读取基线文件清单。"""
+    workbook = load_workbook(source.expanduser().resolve(), data_only=True)
+
+    try:
+        if not sheet_name:
+            raise ValueError("未选择基线 Excel 工作表。")
+
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(
+                f"Excel 中不存在工作表“{sheet_name}”。"
+                f"可用工作表：{', '.join(workbook.sheetnames)}"
+            )
+
+        sheet = workbook[sheet_name]
+        header_row = None
+        columns: dict[str, int] = {}
+
+        # 只在用户选择的工作表中寻找表头。
+        for row_idx in range(1, min(sheet.max_row or 0, 80) + 1):
+            found: dict[str, int] = {}
+            for col_idx in range(1, min(sheet.max_column or 0, 40) + 1):
+                role = _manifest_header_role(sheet.cell(row_idx, col_idx).value)
+                if role and role not in found:
+                    found[role] = col_idx
+
+            if {"name", "path", "md5"}.issubset(found):
+                header_row = row_idx
+                columns = found
+                break
+
+        if header_row is None:
+            raise ValueError(
+                f"工作表“{sheet_name}”中未找到可识别的文件清单表头。"
+                "至少需要：文件名称、路径、MD5值。"
+            )
+
+        records: list[tuple[str, str, str, str, str]] = []
+        for row_idx in range(header_row + 1, sheet.max_row + 1):
+            name = _cell_text(sheet.cell(row_idx, columns["name"]).value)
+            version = (
+                _cell_text(sheet.cell(row_idx, columns["version"]).value)
+                if "version" in columns else ""
+            )
+            path_value = _cell_text(sheet.cell(row_idx, columns["path"]).value)
+            md5 = _cell_text(sheet.cell(row_idx, columns["md5"]).value)
+            note = (
+                _cell_text(sheet.cell(row_idx, columns["note"]).value)
+                if "note" in columns else ""
+            )
+
+            if not any((name, version, path_value, md5, note)):
+                continue
+            if not name or not path_value or not md5:
+                continue
+
+            if not version:
+                version = default_version
+
+            if not include_metadata and name.casefold() in METADATA_FILE_NAMES:
+                if log:
+                    log(f"跳过元数据文件：{path_value}/{name}")
+                continue
+
+            records.append((name, version, path_value, md5, note))
+
+            if log:
+                log(f"基线 MD5 {md5}  {path_value}/{name}")
+
+        if not records:
+            raise ValueError(f"工作表“{sheet_name}”没有读取到有效的文件清单。")
+
+        if log:
+            log(f"已选择基线工作表：{sheet_name}")
+            log(f"基线记录：{len(records)} 条")
+
+        return records, sheet_name
+    finally:
+        workbook.close()
+
+
+
+def _manifest_workbook_from_template(template: Path | None, sheet_name: str | None = None,
+                                     clear_data_rows: bool = True):
     """Create a workbook and collect reusable manifest row styles."""
     if template:
         template = template.expanduser().resolve()
         wb = load_workbook(template)
-        ws = wb.active
+        if sheet_name is not None:
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(f"找不到 Excel 工作表：{sheet_name}")
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
         style_by_path: dict[str, tuple] = {}
         style_by_kind: dict[str, tuple] = {}
         style_by_fill: dict[str, tuple] = {}
@@ -331,7 +481,7 @@ def _manifest_workbook_from_template(template: Path | None):
                     tuple(copy(ws.cell(row, col).fill) for col in range(1, 6)),
                 )
 
-        if ws.max_row > 1:
+        if clear_data_rows and ws.max_row > 1:
             ws.delete_rows(2, ws.max_row - 1)
     else:
         wb = Workbook()
@@ -378,8 +528,6 @@ def _manifest_workbook_from_template(template: Path | None):
         ws.delete_rows(2, 1)
 
     return wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind
-
-
 def _copy_manifest_layout(source_ws, target_ws) -> None:
     """Copy the visible manifest header and column layout to another sheet."""
     for col in range(1, 6):
@@ -515,9 +663,12 @@ def _write_compare_section(ws, start_row: int, title: str, fill_color: str,
 
 def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, str]],
                              compare_records: list[tuple[str, str, str, str, str]],
-                             output: Path, template: Path | None = None) -> tuple[int, int, int]:
+                             output: Path, template: Path | None = None,
+                             template_sheet: str | None = None) -> tuple[int, int, int]:
     """Write a three-sheet workbook: baseline, compared version, and comparison result."""
-    wb, base_ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind = _manifest_workbook_from_template(template)
+    wb, base_ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind = _manifest_workbook_from_template(
+        template, template_sheet
+    )
     for sheet in list(wb.worksheets):
         if sheet is not base_ws:
             wb.remove(sheet)
@@ -537,7 +688,7 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
 
     added_rows = [[record[0], record[2], "", record[3], "新增"] for record in added]
     missing_rows = [[record[0], record[2], record[3], "", "缺少"] for record in missing]
-    changed_rows = [[baseline[0], baseline[2], baseline[3], compared[3], "MD5不同"] for baseline, compared in changed]
+    changed_rows = [[baseline[0], baseline[2], baseline[3], compared[3], "MD5变化"] for baseline, compared in changed]
 
     row = 1
     row = _write_compare_section(result_ws, row, "新增：", "FF00B0F0", added_rows)
@@ -581,112 +732,38 @@ def _remove_extraction_dir(extraction_dir: Path, output_dir: Path,
         log(f"已删除临时解压目录：{extraction_resolved}")
 
 
-def _remove_metadata_files(extracted_root: Path,
-                           log: Callable[[str], None] | None = None) -> int:
-    removed = 0
-    for path in sorted(extracted_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_file() and not path.is_symlink() and _is_metadata_file(path.relative_to(extracted_root)):
-            path.unlink()
-            removed += 1
-    if removed and log:
-        log(f"已删除多余元数据文件：{removed} 个（checksums.txt/.gitkeep）")
-    return removed
-
-
-def generate(source: Path, output_dir: Path, template: Path | None = None, version: str | None = None,
-             keep_extracted: bool = False, include_metadata: bool = True,
-             log: Callable[[str], None] | None = None) -> tuple[Path, Path, int]:
-    source = source.expanduser().resolve()
-    output_dir = output_dir.expanduser().resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"找不到输入文件：{source}")
-    if source.suffix.lower() != ".sh" and log:
-        log("提示：输入文件扩展名不是 .sh，仍继续尝试识别格式。")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    version = (version or "").strip().upper() or version_from_path(source)
-    if template:
-        template = template.expanduser().resolve()
-        if not template.is_file():
-            raise FileNotFoundError(f"找不到 Excel 模板：{template}")
-
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    extraction_dir = output_dir / f"{source.stem}_extracted_{stamp}_{time.time_ns() % 1000000:06d}"
-    output_xlsx = _next_output_path(source, output_dir, stamp)
-
-    if log:
-        log(f"输入：{source}")
-        log(f"版本号：{version}")
-        log(f"Excel 样式：{template if template else '内置自动样式'}")
-        log("正在解压嵌套压缩包，请稍候……")
-
-    try:
-        count = extract_archive(source, extraction_dir, log)
-        if log:
-            log(f"解压完成：{count} 个普通文件")
-            log("正在计算 MD5 并写入 Excel……")
-        records = collect_records(extraction_dir, version, include_metadata, log)
-        make_workbook(records, output_xlsx, template)
-        if not include_metadata and keep_extracted:
-            _remove_metadata_files(extraction_dir, log)
-        if log:
-            log(f"Excel 已生成：{output_xlsx}")
-            log(f"清单记录：{len(records)} 条")
-    finally:
-        if not keep_extracted and extraction_dir.exists():
-            try:
-                _remove_extraction_dir(extraction_dir, output_dir, log)
-            except Exception as exc:
-                # Do not discard a valid Excel result just because Windows is
-                # temporarily holding one extracted file open.
-                if log:
-                    log(f"警告：临时目录删除失败，请手动删除：{extraction_dir}（{exc}）")
-
-    if log and keep_extracted:
-        log(f"解压目录：{extraction_dir}")
-    return output_xlsx, extraction_dir, len(records)
-
-
-
-def _next_comparison_output_path(baseline_source: Path, compare_source: Path,
-                                 output_dir: Path, stamp: str) -> Path:
-    """Build a non-overwriting filename for a two-version comparison report."""
-    def clean_stem(value: str) -> str:
-        value = re.sub(r"[<>:\"/\\|?*]+", "_", value).strip(" .")
-        return value or "usbi"
-
-    baseline_name = clean_stem(baseline_source.stem)
-    compare_name = clean_stem(compare_source.stem)
-    base = output_dir / f"{baseline_name}_vs_{compare_name}_对比清单_{stamp}.xlsx"
-    if not base.exists():
-        return base
-    index = 1
-    while True:
-        candidate = output_dir / f"{baseline_name}_vs_{compare_name}_对比清单_{stamp}_{index:02d}.xlsx"
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
-def generate_comparison(baseline_source: Path, compare_source: Path, output_dir: Path,
-                        template: Path | None = None,
-                        baseline_version: str | None = None,
-                        compare_version: str | None = None,
-                        keep_extracted: bool = False,
-                        include_metadata: bool = True,
-                        log: Callable[[str], None] | None = None) -> tuple[Path, int, int, int]:
-    """Extract two archives and create a three-sheet comparison workbook."""
+def generate_comparison(
+    baseline_source: Path,
+    compare_source: Path,
+    output_dir: Path,
+    template: Path | None = None,
+    baseline_version: str | None = None,
+    compare_version: str | None = None,
+    keep_extracted: bool = False,
+    include_metadata: bool = True,
+    log: Callable[[str], None] | None = None,
+    baseline_sheet: str | None = None,
+) -> tuple[Path, int, int, int]:
+    """使用指定 Excel 工作表作为基线，对比 usbi.sh。"""
     baseline_source = baseline_source.expanduser().resolve()
     compare_source = compare_source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
-    for label, source in (("基线版本", baseline_source), ("对比版本", compare_source)):
-        if not source.is_file():
-            raise FileNotFoundError(f"找不到{label}输入文件：{source}")
-        if source.suffix.lower() != ".sh" and log:
-            log(f"提示：{label}文件扩展名不是 .sh，仍继续尝试识别格式。")
+
+    if not baseline_source.is_file():
+        raise FileNotFoundError(f"找不到基线 Excel：{baseline_source}")
+    if baseline_source.suffix.lower() != ".xlsx":
+        raise ValueError("基线文件必须是 Excel .xlsx 文件。")
+    if not baseline_sheet:
+        raise ValueError("请选择基线 Excel 工作表。")
+
+    if not compare_source.is_file():
+        raise FileNotFoundError(f"找不到对比 usbi.sh：{compare_source}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    baseline_version = (baseline_version or "").strip().upper() or version_from_path(baseline_source)
+
+    baseline_version = (baseline_version or "").strip().upper()
     compare_version = (compare_version or "").strip().upper() or version_from_path(compare_source)
+
     if template:
         template = template.expanduser().resolve()
         if not template.is_file():
@@ -694,58 +771,102 @@ def generate_comparison(baseline_source: Path, compare_source: Path, output_dir:
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     unique = time.time_ns() % 1000000
-    baseline_extraction = output_dir / f"{baseline_source.stem}_baseline_extracted_{stamp}_{unique:06d}"
-    compare_extraction = output_dir / f"{compare_source.stem}_compare_extracted_{stamp}_{(unique + 1) % 1000000:06d}"
-    output_xlsx = _next_comparison_output_path(baseline_source, compare_source, output_dir, stamp)
+    compare_extraction = output_dir / (
+        f"{compare_source.stem}_compare_extracted_{stamp}_{unique:06d}"
+    )
+    output_xlsx = _next_comparison_output_path(
+        baseline_source, compare_source, output_dir, stamp
+    )
 
-    if log:
-        log(f"基线版本：{baseline_source}")
-        log(f"基线版本号：{baseline_version}")
-        log(f"对比版本：{compare_source}")
-        log(f"对比版本号：{compare_version}")
-        log(f"Excel 样式：{template if template else '内置自动样式'}")
-        log("正在解压基线版本……")
+    extraction_dirs: list[Path] = [compare_extraction]
 
-    extraction_dirs = (baseline_extraction, compare_extraction)
-    baseline_records: list[tuple[str, str, str, str, str]] = []
-    compare_records: list[tuple[str, str, str, str, str]] = []
     try:
-        baseline_count = extract_archive(baseline_source, baseline_extraction, log)
         if log:
-            log(f"基线版本解压完成：{baseline_count} 个普通文件")
-            log("正在解压对比版本……")
-        compare_count = extract_archive(compare_source, compare_extraction, log)
-        if log:
-            log(f"对比版本解压完成：{compare_count} 个普通文件")
-            log("正在分别计算 MD5 并执行文件对比……")
-        baseline_records = collect_records(baseline_extraction, baseline_version, include_metadata, log)
-        compare_records = collect_records(compare_extraction, compare_version, include_metadata, log)
-        added_count, missing_count, changed_count = make_comparison_workbook(
-            baseline_records, compare_records, output_xlsx, template
+            log(f"基线 Excel：{baseline_source}")
+            log(f"基线工作表：{baseline_sheet}")
+            log(f"对比版本：{compare_source}")
+            log(f"对比版本号：{compare_version}")
+            log("正在读取基线 Excel…")
+
+        baseline_records, selected_sheet = load_manifest_records_from_workbook(
+            baseline_source,
+            baseline_version,
+            include_metadata,
+            log,
+            sheet_name=baseline_sheet,
         )
+
+        if log:
+            log(f"正在解压 usbi.sh：{compare_source}")
+
+        compare_count = extract_archive(compare_source, compare_extraction, log)
+
+        if log:
+            log(f"usbi.sh 解压完成：{compare_count} 个普通文件")
+            log("正在计算 MD5 并执行文件对比…")
+
+        compare_records = collect_records(
+            compare_extraction,
+            compare_version,
+            include_metadata,
+            log,
+        )
+
+        comparison_template = template
+        comparison_template_sheet = None
+
+        # 未单独指定模板时，直接复用用户选择的基线工作表样式。
+        if comparison_template is None:
+            comparison_template = baseline_source
+            comparison_template_sheet = selected_sheet
+
+        added_count, missing_count, changed_count = make_comparison_workbook(
+            baseline_records,
+            compare_records,
+            output_xlsx,
+            comparison_template,
+            comparison_template_sheet,
+        )
+
         if log:
             log(f"对比 Excel 已生成：{output_xlsx}")
             log(f"基线记录：{len(baseline_records)} 条；对比记录：{len(compare_records)} 条")
             log(f"新增：{added_count} 条；缺少：{missing_count} 条；差异：{changed_count} 条")
+
+        return output_xlsx, added_count, missing_count, changed_count
+
     finally:
-        if not keep_extracted:
-            for extraction_dir in extraction_dirs:
-                if extraction_dir.exists():
-                    try:
-                        _remove_extraction_dir(extraction_dir, output_dir, log)
-                    except Exception as exc:
-                        if log:
-                            log(f"警告：临时目录删除失败，请手动删除：{extraction_dir}（{exc}）")
-        elif not include_metadata:
+        if not keep_extracted and compare_extraction.exists():
+            try:
+                _remove_extraction_dir(compare_extraction, output_dir, log)
+            except Exception as exc:
+                if log:
+                    log(f"警告：临时目录删除失败，请手动删除：{compare_extraction}（{exc}）")
+        elif keep_extracted and not include_metadata:
             for extraction_dir in extraction_dirs:
                 if extraction_dir.exists():
                     _remove_metadata_files(extraction_dir, log)
 
-    if log and keep_extracted:
-        log(f"基线解压目录：{baseline_extraction}")
-        log(f"对比解压目录：{compare_extraction}")
-    return output_xlsx, added_count, missing_count, changed_count
 
+
+def _next_comparison_output_path(baseline_source: Path, compare_source: Path,
+                                 output_dir: Path, stamp: str) -> Path:
+    """Build a non-overwriting filename for a two-version comparison report."""
+    def clean_stem(value: str) -> str:
+        value = re.sub(r'[<>:"/\|?*]+', '_', value).strip(' .')
+        return value or 'usbi'
+
+    baseline_name = clean_stem(baseline_source.stem)
+    compare_name = clean_stem(compare_source.stem)
+    base = output_dir / f'{baseline_name}_vs_{compare_name}_对比清单_{stamp}.xlsx'
+    if not base.exists():
+        return base
+    index = 1
+    while True:
+        candidate = output_dir / f'{baseline_name}_vs_{compare_name}_对比清单_{stamp}_{index:02d}.xlsx'
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 class App:
@@ -756,10 +877,11 @@ class App:
         self.ttk = ttk
         self.dnd = dnd
         self.root = root
-        root.title("usbi.sh 解压并生成 Excel 清单")
+        root.title("Excel 工作簿对比 usbi.sh 清单")
         root.geometry("900x650")
         root.minsize(820, 580)
         self.baseline_source = tk.StringVar()
+        self.baseline_sheet = tk.StringVar()
         self.compare_source = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.template = tk.StringVar(value="")
@@ -782,73 +904,89 @@ class App:
         main.columnconfigure(1, weight=1)
         main.columnconfigure(3, weight=1)
 
-        ttk.Label(main, text="基线版本 usbi.sh（可选）：").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="基线 Excel 工作簿（必选）：").grid(row=0, column=0, sticky="w", pady=6)
         baseline_entry = ttk.Entry(main, textvariable=self.baseline_source)
         baseline_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
         baseline_entry.drop_target_register(self.dnd.DND_FILES)
         baseline_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.baseline_source))
-        ttk.Button(main, text="选择文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(main, text="选择基线文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="对比版本 usbi.sh（必选）：").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="基线工作表（必选）：").grid(row=1, column=0, sticky="w", pady=6)
+        self.baseline_sheet_combo = ttk.Combobox(
+            main,
+            textvariable=self.baseline_sheet,
+            state="readonly",
+            width=50,
+        )
+        self.baseline_sheet_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+
+        ttk.Label(main, text="对比版本 usbi.sh（必选）：").grid(row=2, column=0, sticky="w", pady=6)
         compare_entry = ttk.Entry(main, textvariable=self.compare_source)
-        compare_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        compare_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
         compare_entry.drop_target_register(self.dnd.DND_FILES)
         compare_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.compare_source))
-        ttk.Button(main, text="选择文件", command=self.pick_compare).grid(row=1, column=3, padx=(8, 0))
+        ttk.Button(main, text="选择文件", command=self.pick_compare).grid(row=2, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="输出目录：").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="输出目录：").grid(row=3, column=0, sticky="w", pady=6)
         output_entry = ttk.Entry(main, textvariable=self.output_dir)
-        output_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
+        output_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
         output_entry.drop_target_register(self.dnd.DND_FILES)
         output_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.output_dir))
-        ttk.Button(main, text="选择目录", command=self.pick_output).grid(row=2, column=3, padx=(8, 0))
+        ttk.Button(main, text="选择目录", command=self.pick_output).grid(row=3, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=4, column=0, sticky="w", pady=6)
         template_entry = ttk.Entry(main, textvariable=self.template)
-        template_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        template_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=6)
         template_entry.drop_target_register(self.dnd.DND_FILES)
         template_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.template))
-        ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=3, column=3, padx=(8, 0))
+        ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=4, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="基线版本号（可选）：").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.baseline_version, width=18).grid(row=4, column=1, sticky="w", pady=6)
-        ttk.Label(main, text="对比版本号（可选）：").grid(row=4, column=2, sticky="e", padx=(12, 8), pady=6)
-        ttk.Entry(main, textvariable=self.compare_version, width=18).grid(row=4, column=3, sticky="w", pady=6)
-        ttk.Label(main, text="留空则分别自动识别版本号", foreground="#555555").grid(
-            row=5, column=1, columnspan=3, sticky="w", pady=(0, 3)
+        ttk.Label(main, text="基线版本号（可选）：").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Entry(main, textvariable=self.baseline_version, width=18).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Label(main, text="对比版本号（可选）：").grid(row=5, column=2, sticky="e", padx=(12, 8), pady=6)
+        ttk.Entry(main, textvariable=self.compare_version, width=18).grid(row=5, column=3, sticky="w", pady=6)
+        ttk.Label(main, text="基线版本号可留空；软件将使用所选工作表中的版本号。", foreground="#555555").grid(
+            row=6, column=1, columnspan=3, sticky="w", pady=(0, 3)
         )
 
         ttk.Checkbutton(main, text="保留临时解压目录（默认自动删除）", variable=self.keep).grid(
-            row=6, column=1, columnspan=3, sticky="w", pady=3
-        )
-        ttk.Checkbutton(main, text="包含 checksums.txt 和 .gitkeep", variable=self.include_metadata).grid(
             row=7, column=1, columnspan=3, sticky="w", pady=3
         )
+        ttk.Checkbutton(main, text="排除 checksums.txt 和 .gitkeep", variable=self.include_metadata).grid(
+            row=8, column=1, columnspan=3, sticky="w", pady=3
+        )
 
-        self.run_button = ttk.Button(main, text="开始解压、计算 MD5 并生成/对比", command=self.start)
+        self.run_button = ttk.Button(main, text="开始生成/对比", command=self.start)
         self.open_button = ttk.Button(main, text="打开生成的 XLSX", command=self.open_generated_xlsx, state="disabled")
-        self.run_button.grid(row=8, column=0, columnspan=2, pady=(14, 10))
-        self.open_button.grid(row=8, column=2, columnspan=2, padx=(8, 0), pady=(14, 10), sticky="w")
+        self.run_button.grid(row=9, column=0, columnspan=2, pady=(14, 10))
+        self.open_button.grid(row=9, column=2, columnspan=2, padx=(8, 0), pady=(14, 10), sticky="w")
 
-        ttk.Label(main, text="运行日志：").grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Label(main, text="运行日志：").grid(row=10, column=0, columnspan=4, sticky="w")
         self.log_box = tk.Text(main, height=18, state="disabled", wrap="none")
-        self.log_box.grid(row=10, column=0, columnspan=4, sticky="nsew", pady=(5, 0))
+        self.log_box.grid(row=11, column=0, columnspan=4, sticky="nsew", pady=(5, 0))
         scroll = ttk.Scrollbar(main, orient="vertical", command=self.log_box.yview)
-        scroll.grid(row=10, column=4, sticky="ns", pady=(5, 0))
+        scroll.grid(row=11, column=4, sticky="ns", pady=(5, 0))
         self.log_box.configure(yscrollcommand=scroll.set)
         main.rowconfigure(10, weight=1)
         ttk.Label(
             main,
-            text="使用说明：支持直接拖拽：基线/对比 .sh 文件、输出目录、Excel 模板.xlsx。对比版本必填；只填写对比版本时生成单版本清单。",
+            text="使用说明：选择基线 Excel 工作簿后，软件会自动读取工作表供选择；再选择待对比 usbi.sh。对比结果按文件路径、文件名和 MD5 进行判断。",
             foreground="#555555",
-        ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
-
+        ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
     def _handle_drop(self, event, variable):
         paths = self.root.tk.splitlist(event.data)
         if not paths:
             return
         path = Path(paths[0]).expanduser()
         variable.set(str(path.resolve() if path.exists() else path))
+        if variable is self.baseline_source and path.is_file() and path.suffix.lower() == ".xlsx":
+            try:
+                sheets = list_workbook_sheets(path)
+                self.baseline_sheet_combo["values"] = sheets
+                self.baseline_sheet.set(sheets[0] if sheets else "")
+                self._log(f"已读取 Excel 工作表：{', '.join(sheets)}")
+            except Exception as exc:
+                self._log(f"读取 Excel 工作表失败：{exc}")
 
     def _log(self, message):
         self.events.put(("log", message))
@@ -898,14 +1036,27 @@ class App:
     def pick_baseline(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="选择基线版本 usbi.sh",
-            filetypes=[("Shell archive", "*.sh"), ("All files", "*.*")],
+            title="选择基线 Excel 工作簿",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")],
         )
-        if path:
-            self.baseline_source.set(path)
-            if not self.output_dir.get():
-                self.output_dir.set(str(Path(path).parent))
-            self.baseline_version.set(version_from_path(Path(path)))
+        if not path:
+            return
+
+        self.baseline_source.set(path)
+
+        if not self.output_dir.get():
+            self.output_dir.set(str(Path(path).parent))
+
+        try:
+            sheets = list_workbook_sheets(Path(path))
+            self.baseline_sheet_combo["values"] = sheets
+            self.baseline_sheet.set(sheets[0] if sheets else "")
+            self._log(f"已读取 Excel 工作表：{', '.join(sheets)}")
+        except Exception as exc:
+            self.baseline_sheet_combo["values"] = ()
+            self.baseline_sheet.set("")
+            from tkinter import messagebox
+            messagebox.showerror("读取 Excel 失败", str(exc))
 
     # Keep the old method name as a small compatibility convenience for callers
     # that used the previous single-input GUI class.
@@ -923,13 +1074,11 @@ class App:
             if not self.output_dir.get():
                 self.output_dir.set(str(Path(path).parent))
             self.compare_version.set(version_from_path(Path(path)))
-
     def pick_output(self):
         from tkinter import filedialog
         path = filedialog.askdirectory(title="选择输出目录")
         if path:
             self.output_dir.set(path)
-
     def pick_template(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
@@ -938,7 +1087,6 @@ class App:
         )
         if path:
             self.template.set(path)
-
     def open_generated_xlsx(self):
         """Open the most recently generated workbook with the system default app."""
         from tkinter import messagebox
@@ -956,7 +1104,6 @@ class App:
                 subprocess.Popen(["xdg-open", str(self.last_output)])
         except OSError as exc:
             messagebox.showerror("打开失败", f"无法打开 XLSX 文件：{exc}")
-
     def start(self):
         if self.busy:
             return
@@ -969,11 +1116,21 @@ class App:
         )
         template = Path(self.template.get().strip().strip('"')) if self.template.get().strip() else None
         from tkinter import messagebox
+        if baseline is None:
+            messagebox.showwarning("提示", "请选择基线 Excel 工作簿。")
+            return
         if compare is None:
             messagebox.showwarning("提示", "请选择有效的对比版本 usbi.sh 文件。")
             return
-        if baseline is not None and not baseline.is_file():
-            messagebox.showwarning("提示", "请选择有效的基线版本 usbi.sh 文件。")
+        if baseline is not None:
+            if not baseline.is_file():
+                messagebox.showwarning("提示", "请选择有效的基线 Excel 工作簿（.xlsx）文件。")
+                return
+            if baseline.suffix.lower() != ".xlsx":
+                messagebox.showwarning("提示", "基线文件请使用 Excel 工作簿（.xlsx）。")
+                return
+        if not self.baseline_sheet.get().strip():
+            messagebox.showwarning("提示", "请选择基线 Excel 工作表。")
             return
         if not compare.is_file():
             messagebox.showwarning("提示", "请选择有效的对比版本 usbi.sh 文件。")
@@ -997,11 +1154,11 @@ class App:
             self.compare_version.get(),
             self.keep.get(),
             self.include_metadata.get(),
+            self.baseline_sheet.get().strip(),
         )
         threading.Thread(target=self._worker, args=args, daemon=True).start()
-
     def _worker(self, baseline, compare, output, template, baseline_version,
-                compare_version, keep, include_metadata):
+                compare_version, keep, include_metadata, baseline_sheet):
         try:
             if baseline is None:
                 result, _, count = generate(
@@ -1011,7 +1168,7 @@ class App:
             else:
                 result = generate_comparison(
                     baseline, compare, output, template, baseline_version, compare_version,
-                    keep, include_metadata, self._log,
+                    keep, include_metadata, self._log, baseline_sheet,
                 )
                 self.events.put(("compare_done", result))
         except Exception as exc:
@@ -1050,10 +1207,13 @@ def cli(args):
             print(f"EXTRACTED: {extraction}")
         return
 
+    if not args.sheet:
+        raise SystemExit("使用 --input 对比时必须提供 --sheet 工作表名称。")
+
     result, added, missing, changed = generate_comparison(
         source, compare_source, output, template,
         args.version, args.compare_version, keep_extracted,
-        not args.no_metadata, log,
+        not args.no_metadata, log, args.sheet,
     )
     print(f"DONE: {result}")
     print(f"ADDED: {added}")
@@ -1061,12 +1221,13 @@ def cli(args):
     print(f"CHANGED: {changed}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract usbi.sh archives and generate an MD5 Excel manifest")
-    parser.add_argument("--input", help="Optional baseline usbi.sh; when omitted, a single manifest is generated for --compare-input")
+    parser = argparse.ArgumentParser(description="Compare a selected Excel baseline worksheet against a usbi.sh archive")
+    parser.add_argument("--input", help="Baseline Excel workbook (.xlsx)")
     parser.add_argument("--compare-input", help="Required compared usbi.sh; when provided with --input, output has three sheets")
     parser.add_argument("--output-dir", help="Output directory")
     parser.add_argument("--template", help="Optional custom xlsx template; omitted means built-in style")
-    parser.add_argument("--version", help="Baseline version, e.g. V1.0")
+    parser.add_argument("--version", help="Baseline version, e.g. V1.0; used when the selected baseline worksheet omits versions")
+    parser.add_argument("--sheet", help="Baseline worksheet name; required when --input is supplied")
     parser.add_argument("--compare-version", help="Compared version, e.g. V1.1")
     parser.add_argument("--keep", action="store_true", help="Keep extracted directories for inspection")
     parser.add_argument("--no-keep", action="store_true", help=argparse.SUPPRESS)
