@@ -42,8 +42,7 @@ PROJECT_ROOT = ROOT.parent
 # an external 工作簿1.xlsx file. A custom template can still be selected manually.
 FROZEN_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-DEFAULT_TEMPLATE_NAME = "工作簿1.xlsx"
-DEFAULT_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "备注"]
+DEFAULT_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "git仓库地址", "备注"]
 METADATA_FILE_NAMES = frozenset({"checksums.txt", ".gitkeep"})
 GREEN_FILL = "FF92D050"
 YELLOW_FILL = "FFFFFF00"
@@ -68,33 +67,6 @@ def _normalise_manifest_path(value: str | None) -> str:
     text = str(value or "").strip().replace("/", "\\")
     text = re.sub(r"\\+", lambda _match: "\\", text).strip("\\")
     return text.casefold()
-
-
-def default_template_path(source: Path | None = None, output_dir: Path | None = None) -> Path | None:
-    """Find the bundled/default workbook without requiring a template argument."""
-    roots: list[Path] = [
-        FROZEN_ROOT,
-        PROJECT_ROOT,
-        ROOT,
-        BUNDLE_ROOT,
-        BUNDLE_ROOT.parent,
-    ]
-    if source:
-        roots.append(source.expanduser().parent)
-    if output_dir:
-        roots.append(output_dir.expanduser())
-    roots.append(Path.cwd())
-
-    seen: set[str] = set()
-    for root in roots:
-        candidate = (root / DEFAULT_TEMPLATE_NAME).expanduser()
-        key = str(candidate).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
 
 
 def _is_metadata_file(relative: Path) -> bool:
@@ -333,6 +305,7 @@ def _manifest_header_role(value: object | None) -> str | None:
         "备注": "note",
         "说明": "note",
         "note": "note",
+        "git仓库地址": "git仓库地址",
     }.get(text)
 
 
@@ -693,9 +666,21 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
     row = 1
     row = _write_compare_section(result_ws, row, "新增：", "FF00B0F0", added_rows)
     row = _write_compare_section(result_ws, row, "缺少：", "FFFFFF00", missing_rows)
-    _write_compare_section(result_ws, row, "差异：", "FFFF0000", changed_rows)
-    # The result sheet contains three independent sections, so one global
-    # AutoFilter would be misleading; keep the sections visually grouped.
+    row = _write_compare_section(result_ws, row, "差异：", "FFFF0000", changed_rows)
+
+    # ---------- 新增：项目经理确认行 ----------
+    confirm_row = row
+    # 合并A~E列，使内容居中
+    result_ws.merge_cells(start_row=confirm_row, start_column=1, end_row=confirm_row, end_column=2)
+    cell = result_ws.cell(confirm_row, 2, "项目经理确认：")
+    cell.font = Font(bold=True, size=12)
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    # 添加浅灰色边框，使与上方表格风格一致
+    thin = Side(style="thin", color="D9DEE7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell.border = border
+    # -------------------------------------
+
     result_ws.auto_filter.ref = None
     result_ws.print_area = f"A1:E{result_ws.max_row}"
 
