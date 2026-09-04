@@ -352,7 +352,7 @@ def _find_manifest_sheet(workbook):
 
 
 def list_workbook_sheets(source: Path) -> list[str]:
-    """读取用户选择的基线 Excel 中的全部工作表名称。"""
+    """读取用户选择的点检表 Excel 中的全部工作表名称。"""
     workbook = load_workbook(source.expanduser().resolve(), read_only=True, data_only=True)
     try:
         return list(workbook.sheetnames)
@@ -367,12 +367,12 @@ def load_manifest_records_from_workbook(
     log: Callable[[str], None] | None = None,
     sheet_name: str | None = None,
 ) -> tuple[list[tuple[str, str, str, str, str]], str]:
-    """从用户指定的 Excel 工作表读取基线文件清单。"""
+    """从用户指定的 Excel 工作表读取点检表文件清单。"""
     workbook = load_workbook(source.expanduser().resolve(), data_only=True)
 
     try:
         if not sheet_name:
-            raise ValueError("未选择基线 Excel 工作表。")
+            raise ValueError("未选择点检表 Excel 工作表。")
 
         if sheet_name not in workbook.sheetnames:
             raise ValueError(
@@ -433,14 +433,14 @@ def load_manifest_records_from_workbook(
             records.append((name, version, path_value, md5, note))
 
             if log:
-                log(f"基线 MD5 {md5}  {path_value}/{name}")
+                log(f"点检表 MD5 {md5}  {path_value}/{name}")
 
         if not records:
             raise ValueError(f"工作表“{sheet_name}”没有读取到有效的文件清单。")
 
         if log:
-            log(f"已选择基线工作表：{sheet_name}")
-            log(f"基线记录：{len(records)} 条")
+            log(f"已选择点检表工作表：{sheet_name}")
+            log(f"点检表记录：{len(records)} 条")
 
         return records, sheet_name
     finally:
@@ -630,7 +630,7 @@ def compare_record_sets(baseline_records: list[tuple[str, str, str, str, str]],
 
 def _write_compare_section(ws, start_row: int, title: str, fill_color: str,
                            rows: list[list[str]]) -> int:
-    headers = ["文件名称", "文件路径", "基线MD5", "对比MD5", "说明"]
+    headers = ["文件名称", "文件路径", "点检表MD5", "安装包MD5", "说明"]
     label = ws.cell(start_row, 1, title)
     label.font = Font(bold=True, size=12)
     header_row = start_row + 1
@@ -673,15 +673,15 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
         if sheet is not base_ws:
             wb.remove(sheet)
 
-    base_ws.title = "基线版本"
+    base_ws.title = "原始点检表"
     _write_manifest_sheet(base_ws, baseline_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
 
-    compare_ws = wb.create_sheet("对比版本")
+    compare_ws = wb.create_sheet("安装包文件信息")
     _copy_manifest_layout(base_ws, compare_ws)
     _write_manifest_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
 
     added, missing, changed = compare_record_sets(baseline_records, compare_records)
-    result_ws = wb.create_sheet("对比结果")
+    result_ws = wb.create_sheet("安装包结果")
     for col, width in {"A": 30, "B": 62, "C": 36, "D": 36, "E": 20}.items():
         result_ws.column_dimensions[col].width = width
     result_ws.freeze_panes = "A3"
@@ -744,20 +744,20 @@ def generate_comparison(
     log: Callable[[str], None] | None = None,
     baseline_sheet: str | None = None,
 ) -> tuple[Path, int, int, int]:
-    """使用指定 Excel 工作表作为基线，对比 usbi.sh。"""
+    """使用指定 Excel 工作表作为点检表，安装包 usbi.sh。"""
     baseline_source = baseline_source.expanduser().resolve()
     compare_source = compare_source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
 
     if not baseline_source.is_file():
-        raise FileNotFoundError(f"找不到基线 Excel：{baseline_source}")
+        raise FileNotFoundError(f"找不到点检表 Excel：{baseline_source}")
     if baseline_source.suffix.lower() != ".xlsx":
-        raise ValueError("基线文件必须是 Excel .xlsx 文件。")
+        raise ValueError("点检表文件必须是 Excel .xlsx 文件。")
     if not baseline_sheet:
-        raise ValueError("请选择基线 Excel 工作表。")
+        raise ValueError("请选择点检表 Excel 工作表。")
 
     if not compare_source.is_file():
-        raise FileNotFoundError(f"找不到对比 usbi.sh：{compare_source}")
+        raise FileNotFoundError(f"找不到安装包 usbi.sh：{compare_source}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -782,11 +782,11 @@ def generate_comparison(
 
     try:
         if log:
-            log(f"基线 Excel：{baseline_source}")
-            log(f"基线工作表：{baseline_sheet}")
-            log(f"对比版本：{compare_source}")
-            log(f"对比版本号：{compare_version}")
-            log("正在读取基线 Excel…")
+            log(f"点检表 Excel：{baseline_source}")
+            log(f"点检表工作表：{baseline_sheet}")
+            log(f"安装包版本：{compare_source}")
+            log(f"安装包版本号：{compare_version}")
+            log("正在读取点检表 Excel…")
 
         baseline_records, selected_sheet = load_manifest_records_from_workbook(
             baseline_source,
@@ -803,7 +803,7 @@ def generate_comparison(
 
         if log:
             log(f"usbi.sh 解压完成：{compare_count} 个普通文件")
-            log("正在计算 MD5 并执行文件对比…")
+            log("正在计算 MD5 并执行文件安装包…")
 
         compare_records = collect_records(
             compare_extraction,
@@ -815,7 +815,7 @@ def generate_comparison(
         comparison_template = template
         comparison_template_sheet = None
 
-        # 未单独指定模板时，直接复用用户选择的基线工作表样式。
+        # 未单独指定模板时，直接复用用户选择的点检表工作表样式。
         if comparison_template is None:
             comparison_template = baseline_source
             comparison_template_sheet = selected_sheet
@@ -829,8 +829,8 @@ def generate_comparison(
         )
 
         if log:
-            log(f"对比 Excel 已生成：{output_xlsx}")
-            log(f"基线记录：{len(baseline_records)} 条；对比记录：{len(compare_records)} 条")
+            log(f"安装包 Excel 已生成：{output_xlsx}")
+            log(f"点检表记录：{len(baseline_records)} 条；安装包记录：{len(compare_records)} 条")
             log(f"新增：{added_count} 条；缺少：{missing_count} 条；差异：{changed_count} 条")
 
         return output_xlsx, added_count, missing_count, changed_count
@@ -858,12 +858,12 @@ def _next_comparison_output_path(baseline_source: Path, compare_source: Path,
 
     baseline_name = clean_stem(baseline_source.stem)
     compare_name = clean_stem(compare_source.stem)
-    base = output_dir / f'{baseline_name}_vs_{compare_name}_对比清单_{stamp}.xlsx'
+    base = output_dir / f'{baseline_name}_vs_{compare_name}_安装包清单_{stamp}.xlsx'
     if not base.exists():
         return base
     index = 1
     while True:
-        candidate = output_dir / f'{baseline_name}_vs_{compare_name}_对比清单_{stamp}_{index:02d}.xlsx'
+        candidate = output_dir / f'{baseline_name}_vs_{compare_name}_安装包清单_{stamp}_{index:02d}.xlsx'
         if not candidate.exists():
             return candidate
         index += 1
@@ -877,7 +877,7 @@ class App:
         self.ttk = ttk
         self.dnd = dnd
         self.root = root
-        root.title("Excel 工作簿对比 usbi.sh 清单")
+        root.title("点检表对照程序")
         root.geometry("900x650")
         root.minsize(820, 580)
         self.baseline_source = tk.StringVar()
@@ -904,14 +904,14 @@ class App:
         main.columnconfigure(1, weight=1)
         main.columnconfigure(3, weight=1)
 
-        ttk.Label(main, text="基线 Excel 工作簿（必选）：").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="点检表 Excel 工作簿（必选）：").grid(row=0, column=0, sticky="w", pady=6)
         baseline_entry = ttk.Entry(main, textvariable=self.baseline_source)
         baseline_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
         baseline_entry.drop_target_register(self.dnd.DND_FILES)
         baseline_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.baseline_source))
-        ttk.Button(main, text="选择基线文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(main, text="选择点检表文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="基线工作表（必选）：").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="点检表工作表（必选）：").grid(row=1, column=0, sticky="w", pady=6)
         self.baseline_sheet_combo = ttk.Combobox(
             main,
             textvariable=self.baseline_sheet,
@@ -920,7 +920,7 @@ class App:
         )
         self.baseline_sheet_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
 
-        ttk.Label(main, text="对比版本 usbi.sh（必选）：").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="安装包版本 usbi.sh（必选）：").grid(row=2, column=0, sticky="w", pady=6)
         compare_entry = ttk.Entry(main, textvariable=self.compare_source)
         compare_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
         compare_entry.drop_target_register(self.dnd.DND_FILES)
@@ -934,18 +934,18 @@ class App:
         output_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.output_dir))
         ttk.Button(main, text="选择目录", command=self.pick_output).grid(row=3, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=4, column=0, sticky="w", pady=6)
-        template_entry = ttk.Entry(main, textvariable=self.template)
-        template_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=6)
-        template_entry.drop_target_register(self.dnd.DND_FILES)
-        template_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.template))
-        ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=4, column=3, padx=(8, 0))
+        # ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=4, column=0, sticky="w", pady=6)
+        # template_entry = ttk.Entry(main, textvariable=self.template)
+        # template_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=6)
+        # template_entry.drop_target_register(self.dnd.DND_FILES)
+        # template_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.template))
+        # ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=4, column=3, padx=(8, 0))
 
-        ttk.Label(main, text="基线版本号（可选）：").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Label(main, text="点检表版本号（可选）：").grid(row=5, column=0, sticky="w", pady=6)
         ttk.Entry(main, textvariable=self.baseline_version, width=18).grid(row=5, column=1, sticky="w", pady=6)
-        ttk.Label(main, text="对比版本号（可选）：").grid(row=5, column=2, sticky="e", padx=(12, 8), pady=6)
+        ttk.Label(main, text="安装包版本号（可选）：").grid(row=5, column=2, sticky="e", padx=(12, 8), pady=6)
         ttk.Entry(main, textvariable=self.compare_version, width=18).grid(row=5, column=3, sticky="w", pady=6)
-        ttk.Label(main, text="基线版本号可留空；软件将使用所选工作表中的版本号。", foreground="#555555").grid(
+        ttk.Label(main, text="点检表版本号可留空；软件将使用所选工作表中的版本号。", foreground="#555555").grid(
             row=6, column=1, columnspan=3, sticky="w", pady=(0, 3)
         )
 
@@ -956,7 +956,7 @@ class App:
             row=8, column=1, columnspan=3, sticky="w", pady=3
         )
 
-        self.run_button = ttk.Button(main, text="开始生成/对比", command=self.start)
+        self.run_button = ttk.Button(main, text="开始生成/安装包", command=self.start)
         self.open_button = ttk.Button(main, text="打开生成的 XLSX", command=self.open_generated_xlsx, state="disabled")
         self.run_button.grid(row=9, column=0, columnspan=2, pady=(14, 10))
         self.open_button.grid(row=9, column=2, columnspan=2, padx=(8, 0), pady=(14, 10), sticky="w")
@@ -970,7 +970,7 @@ class App:
         main.rowconfigure(10, weight=1)
         ttk.Label(
             main,
-            text="使用说明：选择基线 Excel 工作簿后，软件会自动读取工作表供选择；再选择待对比 usbi.sh。对比结果按文件路径、文件名和 MD5 进行判断。",
+            text="使用说明：选择点检表 Excel 工作簿后，软件会自动读取工作表供选择；再选择待安装包 usbi.sh。安装包结果按文件路径、文件名和 MD5 进行判断。",
             foreground="#555555",
         ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
     def _handle_drop(self, event, variable):
@@ -1019,7 +1019,7 @@ class App:
                     self.run_button.configure(state="normal")
                     from tkinter import messagebox
                     messagebox.showinfo(
-                        "对比完成",
+                        "安装包完成",
                         f"Excel 已生成：\n{output}\n\n新增：{added} 条\n缺少：{missing} 条\n差异：{changed} 条",
                     )
                 elif event == "error":
@@ -1036,7 +1036,7 @@ class App:
     def pick_baseline(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="选择基线 Excel 工作簿",
+            title="选择点检表 Excel 工作簿",
             filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")],
         )
         if not path:
@@ -1066,7 +1066,7 @@ class App:
     def pick_compare(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="选择对比版本 usbi.sh",
+            title="选择安装包版本 usbi.sh",
             filetypes=[("Shell archive", "*.sh"), ("All files", "*.*")],
         )
         if path:
@@ -1117,23 +1117,23 @@ class App:
         template = Path(self.template.get().strip().strip('"')) if self.template.get().strip() else None
         from tkinter import messagebox
         if baseline is None:
-            messagebox.showwarning("提示", "请选择基线 Excel 工作簿。")
+            messagebox.showwarning("提示", "请选择点检表 Excel 工作簿。")
             return
         if compare is None:
-            messagebox.showwarning("提示", "请选择有效的对比版本 usbi.sh 文件。")
+            messagebox.showwarning("提示", "请选择有效的安装包版本 usbi.sh 文件。")
             return
         if baseline is not None:
             if not baseline.is_file():
-                messagebox.showwarning("提示", "请选择有效的基线 Excel 工作簿（.xlsx）文件。")
+                messagebox.showwarning("提示", "请选择有效的点检表 Excel 工作簿（.xlsx）文件。")
                 return
             if baseline.suffix.lower() != ".xlsx":
-                messagebox.showwarning("提示", "基线文件请使用 Excel 工作簿（.xlsx）。")
+                messagebox.showwarning("提示", "点检表文件请使用 Excel 工作簿（.xlsx）。")
                 return
         if not self.baseline_sheet.get().strip():
-            messagebox.showwarning("提示", "请选择基线 Excel 工作表。")
+            messagebox.showwarning("提示", "请选择点检表 Excel 工作表。")
             return
         if not compare.is_file():
-            messagebox.showwarning("提示", "请选择有效的对比版本 usbi.sh 文件。")
+            messagebox.showwarning("提示", "请选择有效的安装包版本 usbi.sh 文件。")
             return
         if template and not template.is_file():
             messagebox.showwarning("提示", "Excel 模板路径无效。")
@@ -1208,7 +1208,7 @@ def cli(args):
         return
 
     if not args.sheet:
-        raise SystemExit("使用 --input 对比时必须提供 --sheet 工作表名称。")
+        raise SystemExit("使用 --input 安装包时必须提供 --sheet 工作表名称。")
 
     result, added, missing, changed = generate_comparison(
         source, compare_source, output, template,
