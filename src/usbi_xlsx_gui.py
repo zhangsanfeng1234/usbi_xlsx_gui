@@ -42,7 +42,10 @@ PROJECT_ROOT = ROOT.parent
 # an external 工作簿1.xlsx file. A custom template can still be selected manually.
 FROZEN_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-DEFAULT_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "git仓库地址", "备注"]
+DEFAULT_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "备注"]
+INSTALL_PACKAGE_HEADERS = ["文件名称", "版本号", "路径", "MD5值", "git仓库地址", "备注"]
+MANIFEST_COLUMN_COUNT = len(DEFAULT_HEADERS)
+INSTALL_PACKAGE_COLUMN_COUNT = len(INSTALL_PACKAGE_HEADERS)
 METADATA_FILE_NAMES = frozenset({"checksums.txt", ".gitkeep"})
 GREEN_FILL = "FF92D050"
 YELLOW_FILL = "FFFFFF00"
@@ -305,7 +308,7 @@ def _manifest_header_role(value: object | None) -> str | None:
         "备注": "note",
         "说明": "note",
         "note": "note",
-        "git仓库地址": "git仓库地址",
+        "git仓库地址": "git_repo",
     }.get(text)
 
 
@@ -442,7 +445,7 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
             path_value = ws.cell(row, 3).value
             if not isinstance(path_value, str) or not path_value.strip():
                 continue
-            styles = tuple(copy(ws.cell(row, col)._style) for col in range(1, 6))
+            styles = tuple(copy(ws.cell(row, col)._style) for col in range(1, MANIFEST_COLUMN_COUNT + 1))
             normalized_path = _normalise_manifest_path(path_value)
             style_by_path.setdefault(normalized_path, styles)
             style_by_kind.setdefault(_style_for_path(path_value), styles)
@@ -451,7 +454,7 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
                 style_by_fill.setdefault(fill_kind, styles)
                 fill_by_kind.setdefault(
                     fill_kind,
-                    tuple(copy(ws.cell(row, col).fill) for col in range(1, 6)),
+                    tuple(copy(ws.cell(row, col).fill) for col in range(1, MANIFEST_COLUMN_COUNT + 1)),
                 )
 
         if clear_data_rows and ws.max_row > 1:
@@ -479,7 +482,7 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
         for fill_kind, color in (("green", GREEN_FILL), ("yellow", YELLOW_FILL)):
             sample_styles = []
             sample_fills = []
-            for col in range(1, 6):
+            for col in range(1, MANIFEST_COLUMN_COUNT + 1):
                 cell = ws.cell(2, col)
                 cell.font = Font(name="Consolas" if col == 1 or col == 4 else "Arial", size=10)
                 cell.fill = PatternFill("solid", fgColor=color) if col < 5 else PatternFill()
@@ -503,7 +506,7 @@ def _manifest_workbook_from_template(template: Path | None, sheet_name: str | No
     return wb, ws, style_by_path, style_by_kind, style_by_fill, fill_by_kind
 def _copy_manifest_layout(source_ws, target_ws) -> None:
     """Copy the visible manifest header and column layout to another sheet."""
-    for col in range(1, 6):
+    for col in range(1, MANIFEST_COLUMN_COUNT + 1):
         letter = openpyxl.utils.get_column_letter(col)
         target_ws.column_dimensions[letter].width = source_ws.column_dimensions[letter].width
         src = source_ws.cell(1, col)
@@ -511,6 +514,43 @@ def _copy_manifest_layout(source_ws, target_ws) -> None:
         if src.has_style:
             dst._style = copy(src._style)
         dst.alignment = copy(src.alignment)
+    target_ws.row_dimensions[1].height = source_ws.row_dimensions[1].height
+
+
+def _copy_install_package_layout(source_ws, target_ws) -> None:
+    """Copy the manifest layout and add git仓库地址 only for the 安装包文件信息 sheet."""
+    # Copy 文件名称/版本号/路径/MD5值 as-is.
+    for col in range(1, MANIFEST_COLUMN_COUNT):
+        letter = openpyxl.utils.get_column_letter(col)
+        target_ws.column_dimensions[letter].width = source_ws.column_dimensions[letter].width
+        src = source_ws.cell(1, col)
+        dst = target_ws.cell(1, col, src.value if src.value is not None else DEFAULT_HEADERS[col - 1])
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.alignment = copy(src.alignment)
+
+    # Insert git仓库地址 before 备注, only on 安装包文件信息.
+    source_note_col = MANIFEST_COLUMN_COUNT
+    note_src = source_ws.cell(1, source_note_col)
+
+    git_col = 5
+    git_letter = openpyxl.utils.get_column_letter(git_col)
+    target_ws.column_dimensions[git_letter].width = 36
+    git_cell = target_ws.cell(1, git_col, INSTALL_PACKAGE_HEADERS[git_col - 1])
+    if note_src.has_style:
+        git_cell._style = copy(note_src._style)
+    git_cell.alignment = copy(note_src.alignment)
+
+    note_col = 6
+    note_letter = openpyxl.utils.get_column_letter(note_col)
+    target_ws.column_dimensions[note_letter].width = source_ws.column_dimensions[
+        openpyxl.utils.get_column_letter(source_note_col)
+    ].width
+    note_cell = target_ws.cell(1, note_col, INSTALL_PACKAGE_HEADERS[note_col - 1])
+    if note_src.has_style:
+        note_cell._style = copy(note_src._style)
+    note_cell.alignment = copy(note_src.alignment)
+
     target_ws.row_dimensions[1].height = source_ws.row_dimensions[1].height
 
 
@@ -548,8 +588,6 @@ def _write_manifest_sheet(ws, records: list[tuple[str, str, str, str, str]],
             cell = ws.cell(row_num, col, value=value if value != "" else None)
             if styles:
                 cell._style = copy(styles[col - 1])
-            # Explicitly replace only the fill.  This is what makes a path
-            # outside the original sample rows visibly follow its category.
             if fills:
                 cell.fill = copy(fills[col - 1])
             alignment = copy(cell.alignment)
@@ -558,10 +596,56 @@ def _write_manifest_sheet(ws, records: list[tuple[str, str, str, str, str]],
             cell.alignment = alignment
 
     end_row = len(records) + 1
-    ws.auto_filter.ref = f"A1:E{end_row}"
+    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(MANIFEST_COLUMN_COUNT)}{end_row}"
     ws.freeze_panes = "A2"
-    ws.print_area = f"A1:E{end_row}"
+    ws.print_area = f"A1:{openpyxl.utils.get_column_letter(MANIFEST_COLUMN_COUNT)}{end_row}"
 
+
+def _write_install_package_sheet(ws, records: list[tuple[str, str, str, str, str]],
+                                 style_by_path: dict[str, tuple], style_by_kind: dict[str, tuple],
+                                 style_by_fill: dict[str, tuple], fill_by_kind: dict[str, tuple]) -> None:
+    """Write the 安装包文件信息 sheet with an extra blank git仓库地址 column."""
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    for col, value in enumerate(INSTALL_PACKAGE_HEADERS, 1):
+        if ws.cell(1, col).value is None:
+            ws.cell(1, col, value)
+
+    last_path_key: str | None = None
+    current_fill_kind = "yellow"
+    for row_num, record in enumerate(records, start=2):
+        path_value = record[2]
+        path_key = _normalise_manifest_path(path_value)
+        if path_key != last_path_key:
+            current_fill_kind = "green" if current_fill_kind == "yellow" else "yellow"
+            last_path_key = path_key
+        style_kind = _style_for_path(path_value)
+        fill_kind = current_fill_kind
+        styles = (
+            style_by_path.get(path_key)
+            or style_by_kind.get(style_kind)
+            or style_by_fill.get(fill_kind)
+        )
+        fills = fill_by_kind.get(fill_kind)
+        values = (record[0], record[1], record[2], record[3], "", record[4])
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row_num, col, value=value if value != "" else None)
+            source_col_index = col if col <= MANIFEST_COLUMN_COUNT else MANIFEST_COLUMN_COUNT
+            if styles:
+                cell._style = copy(styles[source_col_index - 1])
+            if fills:
+                cell.fill = copy(fills[source_col_index - 1])
+            alignment = copy(cell.alignment)
+            alignment.vertical = "center"
+            alignment.wrap_text = False
+            cell.alignment = alignment
+
+    end_row = len(records) + 1
+    last_col = openpyxl.utils.get_column_letter(INSTALL_PACKAGE_COLUMN_COUNT)
+    ws.auto_filter.ref = f"A1:{last_col}{end_row}"
+    ws.freeze_panes = "A2"
+    ws.print_area = f"A1:{last_col}{end_row}"
 
 def make_workbook(records: list[tuple[str, str, str, str, str]], output: Path,
                   template: Path | None = None) -> None:
@@ -650,8 +734,8 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
     _write_manifest_sheet(base_ws, baseline_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
 
     compare_ws = wb.create_sheet("安装包文件信息")
-    _copy_manifest_layout(base_ws, compare_ws)
-    _write_manifest_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
+    _copy_install_package_layout(base_ws, compare_ws)
+    _write_install_package_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
 
     added, missing, changed = compare_record_sets(baseline_records, compare_records)
     result_ws = wb.create_sheet("对比结果")
@@ -671,11 +755,13 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
     # ---------- 新增：项目经理确认行 ----------
     confirm_row = row
     # 合并A~E列，使内容居中
+    # 合并 A:B
     result_ws.merge_cells(start_row=confirm_row, start_column=1, end_row=confirm_row, end_column=2)
-    cell = result_ws.cell(confirm_row, 2, "项目经理确认：")
+    # 合并单元格只能给左上角 A 单元格赋值
+    cell = result_ws.cell(confirm_row, 1, "项目经理确认：")
     cell.font = Font(bold=True, size=12)
     cell.alignment = Alignment(horizontal="center", vertical="center")
-    # 添加浅灰色边框，使与上方表格风格一致
+
     thin = Side(style="thin", color="D9DEE7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     cell.border = border
