@@ -681,7 +681,7 @@ def make_comparison_workbook(baseline_records: list[tuple[str, str, str, str, st
     _write_manifest_sheet(compare_ws, compare_records, style_by_path, style_by_kind, style_by_fill, fill_by_kind)
 
     added, missing, changed = compare_record_sets(baseline_records, compare_records)
-    result_ws = wb.create_sheet("安装包结果")
+    result_ws = wb.create_sheet("对比结果")
     for col, width in {"A": 30, "B": 62, "C": 36, "D": 36, "E": 20}.items():
         result_ws.column_dimensions[col].width = width
     result_ws.freeze_panes = "A3"
@@ -858,12 +858,12 @@ def _next_comparison_output_path(baseline_source: Path, compare_source: Path,
 
     baseline_name = clean_stem(baseline_source.stem)
     compare_name = clean_stem(compare_source.stem)
-    base = output_dir / f'{baseline_name}_vs_{compare_name}_安装包清单_{stamp}.xlsx'
+    base = output_dir / f'安装包清单_{stamp}.xlsx'
     if not base.exists():
         return base
     index = 1
     while True:
-        candidate = output_dir / f'{baseline_name}_vs_{compare_name}_安装包清单_{stamp}_{index:02d}.xlsx'
+        candidate = output_dir / f'安装包清单_{stamp}_{index:02d}.xlsx'
         if not candidate.exists():
             return candidate
         index += 1
@@ -956,7 +956,7 @@ class App:
             row=8, column=1, columnspan=3, sticky="w", pady=3
         )
 
-        self.run_button = ttk.Button(main, text="开始生成/安装包", command=self.start)
+        self.run_button = ttk.Button(main, text="开始对比安装包", command=self.start)
         self.open_button = ttk.Button(main, text="打开生成的 XLSX", command=self.open_generated_xlsx, state="disabled")
         self.run_button.grid(row=9, column=0, columnspan=2, pady=(14, 10))
         self.open_button.grid(row=9, column=2, columnspan=2, padx=(8, 0), pady=(14, 10), sticky="w")
@@ -970,7 +970,7 @@ class App:
         main.rowconfigure(10, weight=1)
         ttk.Label(
             main,
-            text="使用说明：选择点检表 Excel 工作簿后，软件会自动读取工作表供选择；再选择待安装包 usbi.sh。安装包结果按文件路径、文件名和 MD5 进行判断。",
+            text="使用说明：选择点检表 Excel 工作簿后，软件会自动读取工作表供选择；再选择待安装包 usbi.sh。对比结果按文件路径、文件名和 MD5 进行判断。",
             foreground="#555555",
         ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
     def _handle_drop(self, event, variable):
