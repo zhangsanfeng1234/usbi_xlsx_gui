@@ -385,21 +385,50 @@ def _manifest_layout_from_columns(columns: dict[str, int], header_values: dict[i
 
 def _detect_manifest_header(ws, max_rows: int = 80, max_cols: int = 40):
     """Return ``(header_row, layout)`` for a worksheet manifest table, if any."""
-    scan_cols = min(max(ws.max_column or 0, CHECKLIST_COLUMN_COUNT), max_cols)
-    for row_idx in range(1, min(ws.max_row or 0, max_rows) + 1):
+    reported_cols = ws.max_column or 0
+    reported_rows = ws.max_row or 0
+    scan_cols = min(max(reported_cols, CHECKLIST_COLUMN_COUNT), max_cols)
+    # read_only sheets may report 0/None dimensions; still probe a small window.
+    scan_rows = min(reported_rows, max_rows) if reported_rows > 0 else max_rows
+
+    def match_row(row_idx: int, values) -> ManifestLayout | None:
         found: dict[str, int] = {}
         header_values: dict[int, str] = {}
-        for col_idx in range(1, scan_cols + 1):
-            header_text = _cell_text(ws.cell(row_idx, col_idx).value)
+        for col_idx, value in enumerate(values, start=1):
+            if col_idx > scan_cols:
+                break
+            header_text = _cell_text(value)
             if header_text:
                 header_values[col_idx] = header_text
             role = _manifest_header_role(header_text)
             if role and role not in found:
                 found[role] = col_idx
-
         if {"name", "path", "md5"}.issubset(found):
-            return row_idx, _manifest_layout_from_columns(found, header_values)
+            return _manifest_layout_from_columns(found, header_values)
+        return None
 
+    # iter_rows is much cheaper than random cell access, especially in read_only mode.
+    try:
+        rows = ws.iter_rows(
+            min_row=1,
+            max_row=scan_rows,
+            min_col=1,
+            max_col=scan_cols,
+            values_only=True,
+        )
+        for row_idx, values in enumerate(rows, start=1):
+            layout = match_row(row_idx, values)
+            if layout is not None:
+                return row_idx, layout
+        return None
+    except Exception:
+        pass
+
+    for row_idx in range(1, scan_rows + 1):
+        values = [ws.cell(row_idx, col_idx).value for col_idx in range(1, scan_cols + 1)]
+        layout = match_row(row_idx, values)
+        if layout is not None:
+            return row_idx, layout
     return None
 
 
@@ -426,11 +455,12 @@ def _find_manifest_sheet(workbook):
 
 def list_workbook_sheets(source: Path) -> list[str]:
     """读取用户选择的点检表 Excel 中可识别的文件清单工作表名称。"""
-    workbook = load_workbook(source.expanduser().resolve(), read_only=True, data_only=True)
+    # data_only is unnecessary for header discovery and slows open on large workbooks.
+    workbook = load_workbook(source.expanduser().resolve(), read_only=True, data_only=False)
     try:
         manifest_sheets = [
             ws.title for ws in workbook.worksheets
-            if _detect_manifest_header(ws) is not None
+            if _detect_manifest_header(ws, max_rows=40, max_cols=20) is not None
         ]
         return manifest_sheets or list(workbook.sheetnames)
     finally:
@@ -879,6 +909,18 @@ def _next_output_path(source: Path, output_dir: Path, stamp: str) -> Path:
         index += 1
 
 
+def _remove_metadata_files(extracted_root: Path,
+                           log: Callable[[str], None] | None = None) -> int:
+    removed = 0
+    for path in sorted(extracted_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_file() and not path.is_symlink() and _is_metadata_file(path.relative_to(extracted_root)):
+            path.unlink()
+            removed += 1
+    if removed and log:
+        log(f"已删除多余元数据文件：{removed} 个（checksums.txt/.gitkeep）")
+    return removed
+
+
 def _remove_extraction_dir(extraction_dir: Path, output_dir: Path,
                           log: Callable[[str], None] | None = None) -> None:
     """Delete only a tool-created extraction directory below output_dir."""
@@ -1057,8 +1099,16 @@ class App:
         self.events = queue.Queue()
         self.busy = False
         self.last_output: Path | None = None
+        self._baseline_sheet_request = ""
         self._build()
         self._poll()
+
+    def _enable_drop(self, widget, variable):
+        """Register drag-and-drop only when tkinterdnd2 is available."""
+        if not self.dnd:
+            return
+        widget.drop_target_register(self.dnd.DND_FILES)
+        widget.dnd_bind("<<Drop>>", lambda event, var=variable: self._handle_drop(event, var))
 
     def _build(self):
         tk, ttk = self.tk, self.ttk
@@ -1070,8 +1120,7 @@ class App:
         ttk.Label(main, text="点检表 Excel 工作簿（必选）：").grid(row=0, column=0, sticky="w", pady=6)
         baseline_entry = ttk.Entry(main, textvariable=self.baseline_source)
         baseline_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
-        baseline_entry.drop_target_register(self.dnd.DND_FILES)
-        baseline_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.baseline_source))
+        self._enable_drop(baseline_entry, self.baseline_source)
         ttk.Button(main, text="选择点检表文件", command=self.pick_baseline).grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(main, text="点检表工作表（必选）：").grid(row=1, column=0, sticky="w", pady=6)
@@ -1086,22 +1135,19 @@ class App:
         ttk.Label(main, text="安装包版本 usbi.sh（必选）：").grid(row=2, column=0, sticky="w", pady=6)
         compare_entry = ttk.Entry(main, textvariable=self.compare_source)
         compare_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
-        compare_entry.drop_target_register(self.dnd.DND_FILES)
-        compare_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.compare_source))
+        self._enable_drop(compare_entry, self.compare_source)
         ttk.Button(main, text="选择文件", command=self.pick_compare).grid(row=2, column=3, padx=(8, 0))
 
         ttk.Label(main, text="输出目录：").grid(row=3, column=0, sticky="w", pady=6)
         output_entry = ttk.Entry(main, textvariable=self.output_dir)
         output_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
-        output_entry.drop_target_register(self.dnd.DND_FILES)
-        output_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.output_dir))
+        self._enable_drop(output_entry, self.output_dir)
         ttk.Button(main, text="选择目录", command=self.pick_output).grid(row=3, column=3, padx=(8, 0))
 
         # ttk.Label(main, text="Excel 模板（可选，默认内置样式）：").grid(row=4, column=0, sticky="w", pady=6)
         # template_entry = ttk.Entry(main, textvariable=self.template)
         # template_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=6)
-        # template_entry.drop_target_register(self.dnd.DND_FILES)
-        # template_entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, self.template))
+        # self._enable_drop(template_entry, self.template)
         # ttk.Button(main, text="选择模板", command=self.pick_template).grid(row=4, column=3, padx=(8, 0))
 
         ttk.Label(main, text="点检表版本号（可选）：").grid(row=5, column=0, sticky="w", pady=6)
@@ -1143,13 +1189,37 @@ class App:
         path = Path(paths[0]).expanduser()
         variable.set(str(path.resolve() if path.exists() else path))
         if variable is self.baseline_source and path.is_file() and path.suffix.lower() == ".xlsx":
+            self._refresh_baseline_sheets(path)
+
+    def _current_baseline_path(self) -> str:
+        text = self.baseline_source.get().strip().strip('"')
+        if not text:
+            return ""
+        path = Path(text).expanduser()
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path)
+
+    def _refresh_baseline_sheets(self, path: Path):
+        """Load worksheet names off the UI thread so choosing a file does not freeze."""
+        try:
+            resolved = str(path.expanduser().resolve())
+        except OSError:
+            resolved = str(path.expanduser())
+        self._baseline_sheet_request = resolved
+        self.baseline_sheet_combo["values"] = ()
+        self.baseline_sheet.set("")
+        self._log(f"正在读取 Excel 工作表：{Path(resolved).name} …")
+
+        def worker(request_path: str = resolved):
             try:
-                sheets = list_workbook_sheets(path)
-                self.baseline_sheet_combo["values"] = sheets
-                self.baseline_sheet.set(sheets[0] if sheets else "")
-                self._log(f"已读取 Excel 工作表：{', '.join(sheets)}")
+                sheets = list_workbook_sheets(Path(request_path))
+                self.events.put(("sheets_loaded", (request_path, sheets)))
             except Exception as exc:
-                self._log(f"读取 Excel 工作表失败：{exc}")
+                self.events.put(("sheets_error", (request_path, f"{type(exc).__name__}: {exc}")))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _log(self, message):
         self.events.put(("log", message))
@@ -1163,6 +1233,25 @@ class App:
                     self.log_box.insert("end", value + "\n")
                     self.log_box.see("end")
                     self.log_box.configure(state="disabled")
+                elif event == "sheets_loaded":
+                    request_path, sheets = value
+                    if request_path != self._baseline_sheet_request:
+                        continue
+                    if request_path != self._current_baseline_path():
+                        continue
+                    self.baseline_sheet_combo["values"] = sheets
+                    self.baseline_sheet.set(sheets[0] if sheets else "")
+                    self._log(f"已读取 Excel 工作表：{', '.join(sheets)}")
+                elif event == "sheets_error":
+                    request_path, message = value
+                    if request_path != self._baseline_sheet_request:
+                        continue
+                    if request_path != self._current_baseline_path():
+                        continue
+                    self.baseline_sheet_combo["values"] = ()
+                    self.baseline_sheet.set("")
+                    from tkinter import messagebox
+                    messagebox.showerror("读取 Excel 失败", message)
                 elif event == "single_done":
                     self.busy = False
                     output, count = value
@@ -1210,16 +1299,7 @@ class App:
         if not self.output_dir.get():
             self.output_dir.set(str(Path(path).parent))
 
-        try:
-            sheets = list_workbook_sheets(Path(path))
-            self.baseline_sheet_combo["values"] = sheets
-            self.baseline_sheet.set(sheets[0] if sheets else "")
-            self._log(f"已读取 Excel 工作表：{', '.join(sheets)}")
-        except Exception as exc:
-            self.baseline_sheet_combo["values"] = ()
-            self.baseline_sheet.set("")
-            from tkinter import messagebox
-            messagebox.showerror("读取 Excel 失败", str(exc))
+        self._refresh_baseline_sheets(Path(path))
 
     # Keep the old method name as a small compatibility convenience for callers
     # that used the previous single-input GUI class.
@@ -1324,16 +1404,12 @@ class App:
                 compare_version, keep, include_metadata, baseline_sheet):
         try:
             if baseline is None:
-                result, _, count = generate(
-                    compare, output, template, compare_version, keep, include_metadata, self._log,
-                )
-                self.events.put(("single_done", (str(result), count)))
-            else:
-                result = generate_comparison(
-                    baseline, compare, output, template, baseline_version, compare_version,
-                    keep, include_metadata, self._log, baseline_sheet,
-                )
-                self.events.put(("compare_done", result))
+                raise ValueError("请选择点检表 Excel 工作簿后再开始对比。")
+            result = generate_comparison(
+                baseline, compare, output, template, baseline_version, compare_version,
+                keep, include_metadata, self._log, baseline_sheet,
+            )
+            self.events.put(("compare_done", result))
         except Exception as exc:
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -1360,18 +1436,10 @@ def cli(args):
     # accepted for compatibility with earlier command lines.
     keep_extracted = bool(getattr(args, "keep", False) and not getattr(args, "no_keep", False))
     if source is None:
-        result, extraction, count = generate(
-            compare_source, output, template, args.compare_version, keep_extracted,
-            not args.no_metadata, log,
-        )
-        print(f"DONE: {result}")
-        print(f"RECORDS: {count}")
-        if keep_extracted:
-            print(f"EXTRACTED: {extraction}")
-        return
+        raise SystemExit("当前版本需要同时提供 --input（点检表 Excel）和 --compare-input（usbi.sh）。")
 
     if not args.sheet:
-        raise SystemExit("使用 --input 安装包时必须提供 --sheet 工作表名称。")
+        raise SystemExit("使用 --input 时必须提供 --sheet 工作表名称。")
 
     result, added, missing, changed = generate_comparison(
         source, compare_source, output, template,
